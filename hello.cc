@@ -33,6 +33,7 @@
 #include <iostream>
 #include <string>
 #include <sstream>
+#include <unordered_map>
 
 /*
  * Command line options
@@ -54,6 +55,8 @@ static struct cmd_line_options {
 	char *recipient;
 	int show_help;
 } cmd_line_options;
+
+std::unordered_map<std::string, mode_t> addl_files;
 
 #define OPTION(t, p)                           \
     { t, offsetof(struct cmd_line_options, p), 1 }
@@ -80,6 +83,8 @@ static int hello_getattr(const char *path, struct stat *stbuf,
 	(void) fi;
 	int res = 0;
 
+	std::unordered_map<std::string, mode_t>::iterator ifile;
+
 	memset(stbuf, 0, sizeof(struct stat));
 	if (strcmp(path, "/") == 0) {
 		stbuf->st_mode = S_IFDIR | 0755;
@@ -88,10 +93,12 @@ static int hello_getattr(const char *path, struct stat *stbuf,
 		stbuf->st_mode = S_IFREG | 0666;
 		stbuf->st_nlink = 1;
 		stbuf->st_size = options.contents.size();
-	} else {
-		stbuf->st_mode = S_IFREG | 0222; // write only
+	} else if ((ifile = addl_files.find(path)) != addl_files.end()) {
+		stbuf->st_mode = S_IFREG | ifile->second;
 		stbuf->st_nlink = 1;
-		stbuf->st_size = 0; // empty
+		stbuf->st_size = 0;
+	} else {
+		res = -ENOENT;
 	}
 
 	return res;
@@ -129,6 +136,10 @@ static int hello_read(const char *path, char *buf, size_t size, off_t offset,
 {
 	size_t len;
 	(void) fi;
+
+	if (addl_files.find(path) != addl_files.end())
+		return 0;
+
 	if (strcmp(path+1, options.filename.c_str()) != 0)
 		return -ENOENT;
 
@@ -164,8 +175,6 @@ static int hello_write(const char *path, const char *buf, size_t size, off_t off
 
 	cmd_ss << " | mail -s 'cs270 testing' " << options.recipient;
 
-	std::cout << cmd_ss.str() << std::endl;
-
 	FILE *fp;
 	fp = popen(cmd_ss.str().c_str(), "r");
 	if (!fp) {
@@ -175,13 +184,40 @@ static int hello_write(const char *path, const char *buf, size_t size, off_t off
 	return size;
 }
 
+static int hello_create(const char *path, mode_t mode,
+					struct fuse_file_info *fi)
+{
+	addl_files.insert({path, mode});
+	return 0;
+}
+
+static int hello_chown(const char *, uid_t, gid_t, struct fuse_file_info *)
+{
+	return 0;
+}
+
+static int hello_utimens(const char *, const struct timespec tv[2],
+					struct fuse_file_info *fi)
+{
+	return 0;
+}
+
+static int hello_chmod(const char *, mode_t, struct fuse_file_info *)
+{
+	return 0;
+}
+
 static struct fuse_operations hello_oper = {
-	.getattr = hello_getattr,
-	.open		 = hello_open,
-	.read		 = hello_read,
-	.write   = hello_write,
-	.readdir = hello_readdir,
-	.init    = hello_init,
+	.getattr  = hello_getattr,
+	.chmod    = hello_chmod,
+	.chown    = hello_chown,
+	.open		  = hello_open,
+	.read		  = hello_read,
+	.write    = hello_write,
+	.readdir  = hello_readdir,
+	.init     = hello_init,
+	.create   = hello_create,
+	.utimens  = hello_utimens,
 };
 
 static void show_help(const char *progname)
