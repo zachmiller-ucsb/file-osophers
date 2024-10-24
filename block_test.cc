@@ -12,31 +12,46 @@ TEST(BlockTest, Test1) {
 
   PCHECK(ftruncate(f, kBlockSize * 16) == 0);
 
-  BlockCache block_cache(f, 8);
+  const std::array<uint8_t, 4> block0{'b', 'l', 'k', '0'};
+  const std::array<uint8_t, 4> block1{'b', 'l', 'k', '1'};
 
-  const char* block0 = "blk0";
-  const char* block1 = "blk1";
+  {
+    BlockCache block_cache(f, 8);
 
-  for (int i = 0; i < kBlockSize; i += 4) {
-    block_cache.WriteBlock(
-        0, std::span(reinterpret_cast<const uint8_t*>(block0), 4), i);
+    for (int i = 0; i < kBlockSize; i += 4) {
+      block_cache.WriteBlock(0, block0, i);
+    }
+
+    for (int i = 0; i < kBlockSize; i += 4) {
+      block_cache.WriteBlock(1, block1, i);
+    }
+
+    // Check what we wrote
+    std::array<uint8_t, 4> buf;
+    for (int i = 0; i < kBlockSize; i += 4) {
+      block_cache.CopyBlock(0, buf, i);
+      ASSERT_EQ(buf, block0);
+    }
+
+    for (int i = 0; i < kBlockSize; i += 4) {
+      block_cache.CopyBlock(1, buf, i);
+      ASSERT_EQ(buf, block1);
+    }
   }
 
-  for (int i = 0; i < kBlockSize; i += 4) {
-    block_cache.WriteBlock(
-        1, std::span(reinterpret_cast<const uint8_t*>(block1), 4), i);
-  }
+  {
+    // Test reloading
+    BlockCache block_cache(f, 8);
+    std::array<uint8_t, 4> buf;
+    for (int i = 0; i < kBlockSize; i += 4) {
+      block_cache.CopyBlock(0, buf, i);
+      ASSERT_EQ(buf, block0);
+    }
 
-  // Check what we wrote
-  //std::array buf 4];
-  //uint8_t buf2[] = "blk0";
-  for (int i = 0; i < kBlockSize; i += 4) {
-    block_cache.CopyBlock(0, {buf, 4}, i);
-    ASSERT_EQ(buf, buf2);
-  }
-
-  for (int i = 0; i < kBlockSize; i += 4) {
-    block_cache.CopyBlock(1, {buf, 4}, i);
+    for (int i = 0; i < kBlockSize; i += 4) {
+      block_cache.CopyBlock(1, buf, i);
+      ASSERT_EQ(buf, block1);
+    }
   }
 
   // Delete test file
