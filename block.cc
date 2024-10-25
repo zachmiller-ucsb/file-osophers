@@ -1,6 +1,7 @@
 #include "block.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #include "glog/logging.h"
 
@@ -46,14 +47,20 @@ void Block::RelinkInFrontOf(Block* next) {
   }
 }
 
+PinnedBlock::PinnedBlock(Block* block) : block_(block) { ++block_->ref_count_; }
+
+PinnedBlock::~PinnedBlock() { --block_->ref_count_; }
+
 BlockCache::BlockCache(const char* path, int cache_size)
-    : cache_size_(cache_size) {
-  fd_ = open(path, O_DIRECT | O_SYNC);
-  PCHECK(fd_ > 0);
-}
+    : BlockCache(open(path, O_DIRECT | O_SYNC), cache_size) {}
 
 BlockCache::BlockCache(int fd, int cache_size)
-    : fd_(fd), cache_size_(cache_size) {}
+    : fd_(fd), cache_size_(cache_size) {
+  PCHECK(fd_ > 0);
+  const int64_t size = lseek64(fd_, 0, SEEK_END);
+  PCHECK(size > 0);
+  block_count_ = size / kBlockSize;
+}
 
 BlockCache::~BlockCache() {
   // Copy block ids so we can mutate
@@ -68,6 +75,11 @@ BlockCache::~BlockCache() {
 
   CHECK(blocks_.empty());
   CHECK(lru_head_ == nullptr);
+}
+
+PinnedBlock BlockCache::LockBlock(int64_t block) {
+  auto loaded_block = LoadBlockToCache(block - 1);
+  return PinnedBlock(loaded_block);
 }
 
 void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
