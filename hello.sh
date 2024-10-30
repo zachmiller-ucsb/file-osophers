@@ -1,10 +1,10 @@
 #!/bin/bash
 
-if mount | grep -q "mountpt"; then
+if mount | grep -q "cs270"; then
   echo "was mounted. unmounting..."
-  fusermount -u ./mountpt
+  fusermount -u /cs270
 fi
 
-g++ -Wall hello.cc `pkg-config fuse3 --cflags --libs` -o hello
+g++ -std=gnu++2a -Wall -Wpedantic -Werror hello.cc `pkg-config fuse3 --cflags --libs` -o hello
 
-./hello -d --recipient="zmiller@ucsb.edu" ./mountpt 2> log &
+./hello -d --recipient="csirlin@ucsb.edu" /cs270 -s 2> log &

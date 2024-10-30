@@ -168,8 +168,7 @@ static int hello_write(const char *path, const char *buf, size_t size, off_t off
 		if (offset + size > options.contents.size()) {
 			options.contents.resize(offset + size);
 		}
-		options.contents.replace(offset, offset + size, buf);
-
+		strncpy((char*) (options.contents.c_str() + offset), buf, size);
 		cmd_ss << "\"" << options.contents << "\"";
 	}
 
