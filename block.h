@@ -20,8 +20,8 @@ class Block {
 
   void RelinkInFrontOf(Block* next);
 
-  std::span<const uint8_t, 4096> data() const { return data_; }
-  std::span<uint8_t, 4096> data_mutable() { return data_; }
+  std::span<const uint8_t, kBlockSize> data() const { return data_; }
+  std::span<uint8_t, kBlockSize> data_mutable() { return data_; }
 
   bool modified() const { return modified_; }
   void set_modified() { modified_ = true; }
@@ -37,13 +37,15 @@ class Block {
   Block* lru_prev_ = nullptr;
   Block* lru_next_ = nullptr;
   bool modified_ = false;
-  std::array<uint8_t, 4096> data_;
+  alignas(kBlockSize) std::array<uint8_t, kBlockSize> data_;
 
   friend class PinnedBlock;
 };
 
 class PinnedBlock {
  public:
+  PinnedBlock() : block_(nullptr) {}
+
   PinnedBlock(Block* block);
 
   ~PinnedBlock();
@@ -53,10 +55,11 @@ class PinnedBlock {
 
   template <typename T>
   T* data_as() {
-    static_assert(std::is_pod_v<T>);
+    static_assert(std::is_standard_layout_v<T> && std::is_trivial_v<T>);
     auto data = data_mutable();
     static_assert(sizeof(T) == kBlockSize);
-    return static_cast<T*>(data.data());
+    block_->set_modified();
+    return reinterpret_cast<T*>(data.data());
   }
 
  private:
@@ -81,6 +84,10 @@ class BlockCache {
                   int64_t offset = 0);
 
  private:
+  BlockCache(const BlockCache&) = delete;
+  BlockCache& operator=(const BlockCache&) = delete;
+  BlockCache(BlockCache&&) = delete;
+
   Block* LoadBlockToCache(int64_t block);
 
   void Drop(int64_t block);

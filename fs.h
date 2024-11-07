@@ -1,20 +1,38 @@
 #ifndef FS_H_
 #define FS_H_
 
+#include <optional>
+
 #include "block.h"
 
+template <typename T>
+constexpr T divide_round_up(T a, T b) {
+  static_assert(std::is_integral_v<T>);
+  return (a + b - 1) / b;
+}
+
 constexpr int kNumDirectBlocks = 10;
+constexpr int kNumBlocksPerIndirect = kBlockSize / sizeof(int64_t);
+constexpr int kNumBlocksPerDoubleIndirect =
+    kNumBlocksPerIndirect * kNumBlocksPerIndirect;
+constexpr int kNumBlocksPerTripleIndirect =
+    kNumBlocksPerIndirect * kNumBlocksPerIndirect * kNumBlocksPerIndirect;
 
 constexpr int64_t kSuperblockBlock = 0;
+constexpr int64_t kRootInode = 2;
 
 constexpr int kBlockGroupDescriptorSize = 32;
-constexpr int kDataBlocksPerBlockGroup = kBlockSize * 8;
+constexpr int kDataBlocksPerBlockGroup = kBlockSize;
 // Effective ratio of 4 blocks per inode
-constexpr int kINodesPerBlockGroup = kBlockSize * 2;
+constexpr int kINodesPerBlockGroup = kBlockSize / 4;
 constexpr int kINodeSize = 256;
+constexpr int kINodesPerTableBlock = kBlockSize / kINodeSize;
 
 constexpr int kINodeTableBlocksPerBlockGroup =
-    (kINodesPerBlockGroup * kINodeSize + kBlockSize - 1) / kBlockSize;
+    divide_round_up(kINodesPerBlockGroup * kINodeSize, kBlockSize);
+constexpr int kNonDataBlocksPerBlockGroup = 1 /* block bitmap */ +
+                                            1 /* inode bitmap */ +
+                                            kINodeTableBlocksPerBlockGroup;
 constexpr int kTotalBlocksPerBlockGroup =
     1 /* block bitmap */ + 1 /* inode bitmap */ +
     kINodeTableBlocksPerBlockGroup + kDataBlocksPerBlockGroup;
@@ -24,8 +42,9 @@ struct Superblock {
   int64_t blocks_count;
   int64_t unallocated_blocks_count;
   int64_t unallocated_inodes_count;
+  int32_t num_block_groups;
 
-  uint8_t padding[4064];
+  uint8_t padding[4060];
 };
 
 struct BlockGroupDescriptor {
@@ -67,17 +86,57 @@ struct INode {
   int64_t direct_blocks[kNumDirectBlocks];
   int64_t single_indirect;
   int64_t double_indirect;
-  uint8_t overflow[96];
+  int64_t triple_indirect;
+  uint8_t overflow[88];
+};
+
+struct INodeTable {
+  INode inodes[kINodesPerTableBlock];
 };
 
 static_assert(sizeof(Superblock) == kBlockSize);
-static_assert(sizeof(INode) == kINodeSize);
 static_assert(sizeof(INodeTable) == kBlockSize);
+static_assert(sizeof(INode) == kINodeSize);
 
 struct DirectoryEntry {
   int64_t inode;
   int8_t name_length;
   char name[];
+};
+
+inline int64_t GroupOfInode(int64_t inode) {
+  return inode / kINodesPerBlockGroup;
+}
+
+class Fileosophy;
+
+struct CachedINode {
+  CachedINode(int64_t inode, INode* data, PinnedBlock block, Fileosophy* fs)
+      : inode(inode),
+        data(data),
+        block(block),
+        fs(fs),
+        block_group(GroupOfInode(inode)) {}
+
+  int64_t inode;
+  INode* data;
+  PinnedBlock block;
+  Fileosophy* fs = nullptr;
+  const int64_t block_group;
+
+  int64_t num_blocks() const {
+    return (data->size + kBlockSize - 1) / kBlockSize;
+  }
+
+  int64_t get_block(int64_t block_index);
+
+  std::optional<int64_t> get_last_block() {
+    const int64_t blocks = num_blocks();
+    if (blocks == 0) {
+      return std::nullopt;
+    }
+    return get_block(blocks - 1);
+  }
 };
 
 class Fileosophy {
@@ -86,8 +145,49 @@ class Fileosophy {
 
   void MakeFS();
 
+  void MakeRootDirectory();
+
+  std::pair<PinnedBlock, BlockGroupDescriptor*> GetBlockGroupDescriptor(
+      int descriptor_num);
+
+  CachedINode GetINode(int64_t inode);
+
  private:
+  void MarkINodeUsed(int64_t inode);
+
+  void InitINode(INode* inode);
+
+  int64_t NewFreeBlock(CachedINode* inode);
+
+  void GrowINode(int64_t inode);
+
+  void ShrinkINode(int64_t inode);
+
+  // Finds a free block in this group
+  // group_i: group no to search in
+  // group: corresponding group data
+  // hint: local starting block to search from (group relative), ie. [0, kDataBlocksPerBlockGroup)
+  // permit_small: Whether to search for fewer than 8 contiguous blocks
+  int64_t FindFreeBlockInBlockGroup(int64_t group_i,
+                                    BlockGroupDescriptor* group, int64_t hint,
+                                    bool permit_small);
+
+  int64_t FirstDataBlockOfGroup(int64_t group) const {
+    return first_data_block_ + kDataBlocksPerBlockGroup * group;
+  }
+
+  int64_t DataBlockToGroup(int64_t block) const {
+
+  }
+
   BlockCache* blocks_;
+
+  PinnedBlock pinned_super_;
+  Superblock* super_;
+
+  int64_t first_data_block_;
+
+  friend class CachedINode;
 };
 
 #endif  // FS_H_

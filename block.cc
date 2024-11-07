@@ -49,10 +49,14 @@ void Block::RelinkInFrontOf(Block* next) {
 
 PinnedBlock::PinnedBlock(Block* block) : block_(block) { ++block_->ref_count_; }
 
-PinnedBlock::~PinnedBlock() { --block_->ref_count_; }
+PinnedBlock::~PinnedBlock() {
+  if (block_) {
+    --block_->ref_count_;
+  }
+}
 
 BlockCache::BlockCache(const char* path, int cache_size)
-    : BlockCache(open(path, O_DIRECT | O_SYNC), cache_size) {}
+    : BlockCache(open(path, O_RDWR | O_DIRECT | O_SYNC), cache_size) {}
 
 BlockCache::BlockCache(int fd, int cache_size)
     : fd_(fd), cache_size_(cache_size) {
@@ -60,6 +64,8 @@ BlockCache::BlockCache(int fd, int cache_size)
   const int64_t size = lseek64(fd_, 0, SEEK_END);
   PCHECK(size > 0);
   block_count_ = size / kBlockSize;
+
+  LOG(INFO) << "Opened fs with " << block_count_ << " blocks";
 }
 
 BlockCache::~BlockCache() {
@@ -78,13 +84,13 @@ BlockCache::~BlockCache() {
 }
 
 PinnedBlock BlockCache::LockBlock(int64_t block) {
-  auto loaded_block = LoadBlockToCache(block - 1);
+  auto loaded_block = LoadBlockToCache(block);
   return PinnedBlock(loaded_block);
 }
 
 void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
                            int64_t offset) {
-  CHECK_LE(offset + dest.size(), kBlockSize);
+  CHECK_LE(offset + std::ssize(dest), kBlockSize);
   auto loaded_block = LoadBlockToCache(block);
 
   memcpy(dest.data(), &loaded_block->data()[offset], dest.size());
@@ -97,7 +103,7 @@ void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
 
 void BlockCache::WriteBlock(int64_t block, std::span<const uint8_t> src,
                             int64_t offset) {
-  CHECK_LE(offset + src.size(), kBlockSize);
+  CHECK_LE(offset + std::ssize(src), kBlockSize);
   auto loaded_block = LoadBlockToCache(block);
 
   memcpy(&loaded_block->data_mutable()[offset], src.data(), src.size());
@@ -116,9 +122,15 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
     return &blk->second;
   }
 
-  PCHECK(lseek64(fd_, block * kBlockSize, SEEK_SET) != -1);
-  PCHECK(read(fd_, blk->second.data_mutable().data(), kBlockSize) ==
-         kBlockSize);
+  PCHECK(lseek64(fd_, block * kBlockSize, SEEK_SET) != -1)
+      << "Failed to seek to block " << block;
+
+  CHECK_EQ(std::ssize(blk->second.data_mutable()), kBlockSize);
+  const auto bytes_read =
+      read(fd_, blk->second.data_mutable().data(), kBlockSize);
+  PCHECK(bytes_read == kBlockSize)
+      << "Failed to read " << kBlockSize << " bytes from block " << block
+      << ", got " << bytes_read;
 
   lru_head_ = &blk->second;
 
@@ -139,6 +151,7 @@ void BlockCache::Drop(int64_t block) {
   blk->Unlink();
 
   if (blk->modified()) {
+    LOG(INFO) << reinterpret_cast<const int64_t*>(blk->data().data())[0];
     PCHECK(lseek64(fd_, block * kBlockSize, SEEK_SET) != -1);
     PCHECK(write(fd_, blk->data().data(), kBlockSize) == kBlockSize);
   }
