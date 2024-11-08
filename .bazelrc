@@ -1,0 +1,1 @@
+build --copt=-Wall --copt=-Werror --cxxopt=-std=c++20

@@ -80,8 +80,21 @@ class BlockCache {
 
   void CopyBlock(int64_t block, std::span<uint8_t> dest, int64_t offset = 0);
 
+  int64_t ReadI64(int64_t block, int64_t offset) {
+    int64_t data;
+    CopyBlock(block, {reinterpret_cast<uint8_t*>(&data), sizeof(int64_t)},
+              offset * sizeof(int64_t));
+    return data;
+  }
+
   void WriteBlock(int64_t block, std::span<const uint8_t> src,
                   int64_t offset = 0);
+
+  void WriteI64(int64_t block, int64_t data, int64_t offset) {
+    WriteBlock(block,
+               {reinterpret_cast<const uint8_t*>(&data), sizeof(int64_t)},
+               offset * sizeof(int64_t));
+  }
 
  private:
   BlockCache(const BlockCache&) = delete;

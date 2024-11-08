@@ -60,17 +60,17 @@ static_assert(sizeof(BlockGroupDescriptor) == kBlockGroupDescriptorSize);
 enum class Mode : int8_t { kUnknown, kRegular, kDirectory };
 
 namespace flags {
-constexpr uint16_t kUsrR = 0x0;
-constexpr uint16_t kUsrW = 0x1;
-constexpr uint16_t kUsrX = 0x2;
-constexpr uint16_t kGrpR = 0x4;
-constexpr uint16_t kGrpW = 0x8;
-constexpr uint16_t kGrpX = 0x10;
-constexpr uint16_t kOthR = 0x20;
-constexpr uint16_t kOthW = 0x40;
-constexpr uint16_t kOthX = 0x80;
-constexpr uint16_t kSetUid = 0x100;
-constexpr uint16_t kSetGid = 0x200;
+constexpr uint16_t kUsrR = 0x1;
+constexpr uint16_t kUsrW = 0x2;
+constexpr uint16_t kUsrX = 0x4;
+constexpr uint16_t kGrpR = 0x8;
+constexpr uint16_t kGrpW = 0x10;
+constexpr uint16_t kGrpX = 0x20;
+constexpr uint16_t kOthR = 0x40;
+constexpr uint16_t kOthW = 0x80;
+constexpr uint16_t kOthX = 0x100;
+constexpr uint16_t kSetUid = 0x200;
+constexpr uint16_t kSetGid = 0x400;
 }  // namespace flags
 
 struct INode {
@@ -125,10 +125,12 @@ struct CachedINode {
   const int64_t block_group;
 
   int64_t num_blocks() const {
-    return (data->size + kBlockSize - 1) / kBlockSize;
+    return divide_round_up<int64_t>(data->size, kBlockSize);
   }
 
   int64_t get_block(int64_t block_index);
+
+  void set_block(int64_t block_index, int64_t block_no);
 
   std::optional<int64_t> get_last_block() {
     const int64_t blocks = num_blocks();
@@ -155,30 +157,51 @@ class Fileosophy {
  private:
   void MarkINodeUsed(int64_t inode);
 
-  void InitINode(INode* inode);
+  void InitINode(INode* inode, Mode mode, int16_t flags, int32_t uid,
+                 int32_t gid);
 
-  int64_t NewFreeBlock(CachedINode* inode);
+  // Finds a new free block relative to hint. Hint is an absolute
+  // block number
+  std::optional<int64_t> NewFreeBlock(int64_t hint);
 
-  void GrowINode(int64_t inode);
+  void GrowINode(CachedINode* inode, int64_t new_size);
 
   void ShrinkINode(int64_t inode);
 
   // Finds a free block in this group
   // group_i: group no to search in
   // group: corresponding group data
-  // hint: local starting block to search from (group relative), ie. [0, kDataBlocksPerBlockGroup)
-  // permit_small: Whether to search for fewer than 8 contiguous blocks
-  int64_t FindFreeBlockInBlockGroup(int64_t group_i,
-                                    BlockGroupDescriptor* group, int64_t hint,
-                                    bool permit_small);
+  // hint: local starting block to search from (group relative), ie. [0,
+  // kDataBlocksPerBlockGroup) permit_small: Whether to search for fewer than 8
+  // contiguous blocks
+  std::optional<int64_t> FindFreeBlockInBlockGroup(int64_t group_i,
+                                                   BlockGroupDescriptor* group,
+                                                   int64_t hint,
+                                                   bool permit_small);
 
   int64_t FirstDataBlockOfGroup(int64_t group) const {
     return first_data_block_ + kDataBlocksPerBlockGroup * group;
   }
 
-  int64_t DataBlockToGroup(int64_t block) const {
-
+  int64_t DataBlockOfGroup(int64_t block, int64_t group) const {
+    return first_data_block_ + kDataBlocksPerBlockGroup * group + block;
   }
+
+  int64_t DataBlockToGroup(int64_t block) const {
+    return (block - first_data_block_) / kDataBlocksPerBlockGroup;
+  }
+
+  // Returns the block number from an indirect array
+  // block is position in blocks from the start of the file, not an
+  // absolute block number.
+  int64_t LookupIndirect(int64_t indirect_list, int64_t block_index, int depth);
+
+  // Writes block_no into the indirect list at position block_index.
+  // Creates indirect arrays as needed, up to depth.
+  // If indirect_list is 0, creates a new indirect list.
+  // Returns the root of the indirect list.
+  int64_t WriteIndirect(int64_t indirect_list, int64_t block_index,
+                        int64_t block_no, int depth);
 
   BlockCache* blocks_;
 
@@ -187,7 +210,7 @@ class Fileosophy {
 
   int64_t first_data_block_;
 
-  friend class CachedINode;
+  friend struct CachedINode;
 };
 
 #endif  // FS_H_

@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "glog/logging.h"
 
@@ -56,12 +57,18 @@ PinnedBlock::~PinnedBlock() {
 }
 
 BlockCache::BlockCache(const char* path, int cache_size)
-    : BlockCache(open(path, O_RDWR | O_DIRECT | O_SYNC), cache_size) {}
+    : BlockCache(open(path, O_RDWR
+#if __linux__
+                                | O_DIRECT
+#endif
+                                | O_SYNC),
+                 cache_size) {
+}
 
 BlockCache::BlockCache(int fd, int cache_size)
     : fd_(fd), cache_size_(cache_size) {
   PCHECK(fd_ > 0);
-  const int64_t size = lseek64(fd_, 0, SEEK_END);
+  const int64_t size = lseek(fd_, 0, SEEK_END);
   PCHECK(size > 0);
   block_count_ = size / kBlockSize;
 
@@ -98,7 +105,7 @@ void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
   loaded_block->RelinkInFrontOf(lru_head_);
   lru_head_ = loaded_block;
 
-  PrintLRU(LOG(INFO));
+  //PrintLRU(LOG(INFO));
 }
 
 void BlockCache::WriteBlock(int64_t block, std::span<const uint8_t> src,
@@ -112,7 +119,7 @@ void BlockCache::WriteBlock(int64_t block, std::span<const uint8_t> src,
   loaded_block->RelinkInFrontOf(lru_head_);
   lru_head_ = loaded_block;
 
-  PrintLRU(LOG(INFO));
+  //PrintLRU(LOG(INFO));
 }
 
 Block* BlockCache::LoadBlockToCache(int64_t block) {
@@ -122,7 +129,7 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
     return &blk->second;
   }
 
-  PCHECK(lseek64(fd_, block * kBlockSize, SEEK_SET) != -1)
+  PCHECK(lseek(fd_, block * kBlockSize, SEEK_SET) != -1)
       << "Failed to seek to block " << block;
 
   CHECK_EQ(std::ssize(blk->second.data_mutable()), kBlockSize);
@@ -138,7 +145,7 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
 }
 
 void BlockCache::Drop(int64_t block) {
-  PrintLRU(LOG(INFO));
+  //PrintLRU(LOG(INFO));
   auto search = blocks_.find(block);
   CHECK(search != blocks_.end());
 
@@ -152,7 +159,7 @@ void BlockCache::Drop(int64_t block) {
 
   if (blk->modified()) {
     LOG(INFO) << reinterpret_cast<const int64_t*>(blk->data().data())[0];
-    PCHECK(lseek64(fd_, block * kBlockSize, SEEK_SET) != -1);
+    PCHECK(lseek(fd_, block * kBlockSize, SEEK_SET) != -1);
     PCHECK(write(fd_, blk->data().data(), kBlockSize) == kBlockSize);
   }
 

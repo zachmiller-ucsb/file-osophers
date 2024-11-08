@@ -1,3 +1,5 @@
 .vscode/
 .idea
+.clwb/
 block_test_*
+bazel-*
