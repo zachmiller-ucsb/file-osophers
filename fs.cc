@@ -73,7 +73,8 @@ void Fileosophy::MakeFS() {
 }
 
 void Fileosophy::MakeRootDirectory() {
-  auto inode = GetINode(0);
+  auto inode = NewINode(0);
+  CHECK_EQ(inode.inode, 0) << "Root should have inode 0";
   using namespace flags;
   InitINode(inode.data, Mode::kDirectory,
             kUsrR | kUsrW | kUsrX | kGrpR | kGrpX | kOthR | kOthX, 0, 0);
@@ -96,6 +97,122 @@ CachedINode Fileosophy::GetINode(int64_t inode) {
   auto* inode_ptr = &inode_table->inodes[local_inode % kINodesPerTableBlock];
 
   return {inode, inode_ptr, p2, this};
+}
+
+namespace {
+std::optional<int64_t> AllocInBitmap(std::span<uint8_t> bitmap, int64_t hint,
+                                     bool permit_small, bool* modified) {
+  const int num_bytes = std::ssize(bitmap);
+  const int num_slots = num_bytes * 8;
+
+  auto try_pos = [&](int64_t local_block) -> bool {
+    const int64_t bitmap_byte = local_block / 8;
+    const int64_t bitmap_pos = local_block % 8;
+
+    return !(bitmap[bitmap_byte] & (1 << bitmap_pos));
+  };
+
+  auto write_pos = [&](int64_t local_block) {
+    const int64_t bitmap_byte = local_block / 8;
+    const int64_t bitmap_pos = local_block % 8;
+
+    bitmap[bitmap_byte] |= (1 << bitmap_pos);
+    // Write back bitmap
+    *modified = true;
+  };
+
+  // If there is a hint, try it first
+  if (hint >= 0) {
+    // Hint should be in this group
+    CHECK_LT(hint, num_slots);
+
+    // First, look at the hint and hint+1
+    if (try_pos(hint)) {
+      write_pos(hint);
+      return hint;
+    } else if (hint < num_slots - 1 && try_pos(hint)) {
+      write_pos(hint + 1);
+      return hint + 1;
+    }
+  }
+
+  if (permit_small) {
+    // Look bit-by-bit
+    for (int i = 0; i < num_bytes; ++i) {
+      if (bitmap[i] != 0xFF) {
+        const int pos = i * 8 + std::countr_one(bitmap[i]);
+        write_pos(pos);
+        return pos;
+      }
+    }
+
+  } else {
+    // Only look for fully empty bytes
+    for (int i = 0; i < num_bytes; ++i) {
+      if (bitmap[i] == 0) {
+        const int pos = i * 8;
+        write_pos(pos);
+        return pos;
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+}  // namespace
+
+CachedINode Fileosophy::NewINode(int32_t group_hint) {
+  if (super_->unallocated_inodes_count <= 0) {
+    LOG(FATAL) << "No inodes left in filesystem";
+  }
+
+  CHECK(group_hint >= 0 && group_hint < super_->num_block_groups);
+
+  auto try_group = [this](int32_t group_i) -> std::optional<int> {
+    auto [p, group] = GetBlockGroupDescriptor(group_i);
+
+    if (group->unallocated_inodes_count <= 0) {
+      return std::nullopt;
+    }
+
+    constexpr int num_bytes = kINodesPerBlockGroup / 8;
+    std::array<uint8_t, num_bytes> bitmap;
+    blocks_->CopyBlock(group->inode_bitmap, bitmap);
+
+    bool modified = false;
+    auto res = AllocInBitmap(bitmap, -1, true, &modified);
+
+    CHECK(res.has_value()) << "Where did the inode go?";
+
+    if (modified) {
+      // Write back bitmap
+      blocks_->WriteBlock(group->inode_bitmap, bitmap);
+    }
+
+    group->unallocated_inodes_count -= 1;
+    super_->unallocated_inodes_count -= 1;
+
+    CHECK(modified == res.has_value()) << "Huh?";
+
+    return LocalINodeToGlobal(group_i, *res);
+  };
+
+  auto res = try_group(group_hint);
+  if (res) {
+    LOG(INFO) << "Allocated inode " << *res << " in group " << group_hint;
+    return GetINode(*res);
+  }
+
+  for (int32_t group_i = 0; group_i < super_->num_block_groups; ++group_i) {
+    if (group_i == group_hint) continue;
+    res = try_group(group_i);
+    if (res) {
+      LOG(INFO) << "Allocated inode " << *res << " in group " << group_i;
+      return GetINode(*res);
+    }
+  }
+
+  LOG(FATAL) << "Where did the inode go?";
 }
 
 void Fileosophy::InitINode(INode* inode, Mode mode, int16_t flags, int32_t uid,
@@ -143,22 +260,14 @@ void Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
     return;
   }
 
-  const auto cur_block = inode->get_last_block();
-
-  int64_t hint;
-  if (!cur_block.has_value()) {
-    // Search in the same block as the inode
-    hint = FirstDataBlockOfGroup(inode->block_group);
-  } else {
-    // Search in the block which holds the inode's last data block
-    hint = *cur_block;
-  }
+  int64_t hint = inode->get_hint();
 
   for (int64_t blk = num_blocks; blk < new_num_blocks; ++blk) {
     auto new_blk = NewFreeBlock(hint);
     CHECK(new_blk.has_value());
     LOG(INFO) << "Inode " << inode->inode << " allocate new block " << *new_blk
               << " hint " << hint;
+    blocks_->WriteBlock(*new_blk, kEmptyBlock);
     inode->set_block(blk, *new_blk);
     hint = *new_blk + 1;
   }
@@ -169,66 +278,37 @@ void Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
 std::optional<int64_t> Fileosophy::FindFreeBlockInBlockGroup(
     int64_t group_i, BlockGroupDescriptor* group, int64_t hint,
     bool permit_small) {
+  if (group->unallocated_blocks_count <= 0) {
+    return std::nullopt;
+  }
+
   constexpr int num_bytes = kDataBlocksPerBlockGroup / 8;
   std::array<uint8_t, num_bytes> bitmap;
   blocks_->CopyBlock(group->block_bitmap, bitmap);
 
-  auto try_pos = [&](int64_t local_block) -> bool {
-    const int64_t bitmap_byte = local_block / 8;
-    const int64_t bitmap_pos = local_block % 8;
+  bool modified = false;
+  auto res = AllocInBitmap(bitmap, hint, permit_small, &modified);
 
-    return !(bitmap.at(bitmap_byte) & (1 << bitmap_pos));
-  };
-
-  auto write_pos = [&](int64_t local_block) {
-    const int64_t bitmap_byte = local_block / 8;
-    const int64_t bitmap_pos = local_block % 8;
-
-    bitmap[bitmap_byte] |= (1 << bitmap_pos);
+  if (modified) {
     // Write back bitmap
     blocks_->WriteBlock(group->block_bitmap, bitmap);
-  };
-
-  // If there is a hint, try it first
-  if (hint >= 0) {
-    // Hint should be in this group
-    CHECK_LT(hint, kDataBlocksPerBlockGroup);
-
-    // First, look at the hint and hint+1
-    if (try_pos(hint)) {
-      write_pos(hint);
-      return DataBlockOfGroup(hint, group_i);
-    } else if (hint < kDataBlocksPerBlockGroup - 1 && try_pos(hint)) {
-      write_pos(hint + 1);
-      return DataBlockOfGroup(hint + 1, group_i);
-    }
   }
 
-  if (permit_small) {
-    // Look bit-by-bit
-    for (int i = 0; i < num_bytes; ++i) {
-      if (bitmap[i] != 0xFF) {
-        const int pos = i * 8 + std::countr_one(bitmap[i]);
-        write_pos(pos);
-        return DataBlockOfGroup(pos, group_i);
-      }
-    }
+  if (res.has_value()) {
+    group->unallocated_blocks_count -= 1;
+    super_->unallocated_blocks_count -= 1;
 
+    return DataBlockOfGroup(*res, group_i);
   } else {
-    // Only look for fully empty bytes
-    for (int i = 0; i < num_bytes; ++i) {
-      if (bitmap[i] == 0) {
-        const int pos = i * 8;
-        write_pos(pos);
-        return DataBlockOfGroup(pos, group_i);
-      }
-    }
+    return std::nullopt;
   }
-
-  return std::nullopt;
 }
 
 std::optional<int64_t> Fileosophy::NewFreeBlock(int64_t hint) {
+  if (super_->unallocated_blocks_count <= 0) {
+    LOG(FATAL) << "No blocks left in filesystem";
+  }
+
   const int start_group_number = DataBlockToGroup(hint);
 
   auto [p, group] = GetBlockGroupDescriptor(start_group_number);
@@ -280,26 +360,89 @@ void CachedINode::set_block(int64_t block_index, int64_t block_no) {
 
   block_index -= kNumDirectBlocks;
   if (block_index < kNumBlocksPerIndirect) {
-    data->single_indirect =
-        fs->WriteIndirect(data->single_indirect, block_index, block_no, 1);
+    data->single_indirect = fs->WriteIndirect(data->single_indirect, get_hint(),
+                                              block_index, block_no, 1);
     return;
   }
 
   block_index -= kNumBlocksPerIndirect;
   if (block_index < kNumBlocksPerDoubleIndirect) {
-    data->double_indirect =
-        fs->WriteIndirect(data->double_indirect, block_index, block_no, 2);
+    data->double_indirect = fs->WriteIndirect(data->double_indirect, get_hint(),
+                                              block_index, block_no, 2);
     return;
   }
 
   block_index -= kNumBlocksPerDoubleIndirect;
   if (block_index < kNumBlocksPerTripleIndirect) {
-    data->triple_indirect =
-        fs->WriteIndirect(data->triple_indirect, block_index, block_no, 3);
+    data->triple_indirect = fs->WriteIndirect(data->triple_indirect, get_hint(),
+                                              block_index, block_no, 3);
     return;
   }
 
   LOG(FATAL) << "Block index too large";
+}
+
+int64_t CachedINode::get_hint() {
+  const auto cur_block = get_last_block();
+
+  if (!cur_block.has_value()) {
+    // Search in the same block as the inode
+    return fs->FirstDataBlockOfGroup(block_group);
+  } else {
+    // Search in the block which holds the inode's last data block
+    return *cur_block;
+  }
+}
+
+namespace {
+template <typename T>
+void read_write_helper(std::span<T> data, int64_t size, int64_t offset,
+                       auto&& op) {
+  CHECK_GE(size, 0);
+  CHECK_GE(offset, 0);
+
+  const auto blk_start = offset / kBlockSize;
+  const auto blk_end = divide_round_up<int64_t>(offset + size, kBlockSize);
+
+  int64_t bytes_read = 0;
+  for (auto i = blk_start; i < blk_end; ++i) {
+    const auto local_start = (i == blk_start) ? (offset % kBlockSize) : 0;
+    const auto local_end =
+        (i == blk_end - 1) ? ((offset + size) % kBlockSize) : kBlockSize;
+    const auto local_size = local_end - local_start;
+
+    // LOG(INFO) << i << ' ' << blk_start << ' ' <<  blk_end << ' ' << size << '
+    // ' << local_start << ' ' << local_end << ' ' << local_size;
+
+    op(i, data.subspan(bytes_read, local_size), local_start);
+    bytes_read += local_size;
+  }
+}
+}  // namespace
+
+void CachedINode::read(std::span<uint8_t> out, int64_t offset) {
+  const auto size = std::ssize(out);
+  CHECK_LT(size + offset, data->size);
+
+  read_write_helper(
+      out, size, offset,
+      [this](int64_t block_i, std::span<uint8_t> d, int64_t start) {
+        auto blk = get_block(block_i);
+        fs->blocks_->CopyBlock(blk, d, start);
+      });
+}
+
+void CachedINode::write(std::span<const uint8_t> in, int64_t offset) {
+  const auto size = std::ssize(in);
+  CHECK_LT(size + offset, data->size);
+
+  read_write_helper(
+      in, size, offset,
+      [this](int64_t block_i, std::span<const uint8_t> d, int64_t start) {
+        auto blk = get_block(block_i);
+        LOG(INFO) << "Write to " << blk << " " << d.size();
+        fs->blocks_->WriteBlock(blk, d, start);
+      });
 }
 
 int64_t Fileosophy::LookupIndirect(const int64_t indirect_list,
@@ -319,15 +462,17 @@ int64_t Fileosophy::LookupIndirect(const int64_t indirect_list,
   return the_block;
 }
 
-int64_t Fileosophy::WriteIndirect(int64_t indirect_list, int64_t block_index,
-                                  int64_t block_no, int depth) {
+int64_t Fileosophy::WriteIndirect(int64_t indirect_list, int64_t hint,
+                                  int64_t block_index, int64_t block_no,
+                                  int depth) {
   const int computed_depth =
       std::max(std::bit_width(static_cast<uint64_t>(block_index)) - 1, 0) / 12;
   CHECK_EQ(computed_depth + 1, depth);
 
   if (indirect_list == 0) {
+    // No indirect list, allocate a new one
     // TODO: Should this be relative to inode?
-    indirect_list = CHECK_NOTNULLOPT(NewFreeBlock(block_no));
+    indirect_list = CHECK_NOTNULLOPT(NewFreeBlock(hint));
     VLOG(1) << "Allocate new indirect root depth=" << depth
             << ", blk=" << indirect_list;
 

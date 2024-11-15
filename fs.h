@@ -108,6 +108,10 @@ inline int64_t GroupOfInode(int64_t inode) {
   return inode / kINodesPerBlockGroup;
 }
 
+inline int64_t LocalINodeToGlobal(int64_t group_i, int64_t inode) {
+  return group_i * kINodesPerBlockGroup + inode;
+}
+
 class Fileosophy;
 
 struct CachedINode {
@@ -139,6 +143,19 @@ struct CachedINode {
     }
     return get_block(blocks - 1);
   }
+
+  int64_t get_hint();
+
+  void read(std::span<uint8_t> out, int64_t offset);
+
+  void write(std::span<const uint8_t> in, int64_t offset);
+};
+
+struct CachedDirectory {
+  CachedDirectory(CachedINode* inode);
+
+  Fileosophy* fs_;
+  CachedINode* inode_;
 };
 
 class Fileosophy {
@@ -154,9 +171,9 @@ class Fileosophy {
 
   CachedINode GetINode(int64_t inode);
 
- private:
-  void MarkINodeUsed(int64_t inode);
+  CachedINode NewINode(int32_t hint);
 
+ private:
   void InitINode(INode* inode, Mode mode, int16_t flags, int32_t uid,
                  int32_t gid);
 
@@ -200,8 +217,8 @@ class Fileosophy {
   // Creates indirect arrays as needed, up to depth.
   // If indirect_list is 0, creates a new indirect list.
   // Returns the root of the indirect list.
-  int64_t WriteIndirect(int64_t indirect_list, int64_t block_index,
-                        int64_t block_no, int depth);
+  int64_t WriteIndirect(int64_t indirect_list, int64_t hint,
+                        int64_t block_index, int64_t block_no, int depth);
 
   BlockCache* blocks_;
 
