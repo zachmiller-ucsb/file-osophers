@@ -37,6 +37,8 @@ constexpr int kTotalBlocksPerBlockGroup =
     1 /* block bitmap */ + 1 /* inode bitmap */ +
     kINodeTableBlocksPerBlockGroup + kDataBlocksPerBlockGroup;
 
+constexpr int kFilenameLen = 255;
+
 struct Superblock {
   int64_t inodes_count;
   int64_t blocks_count;
@@ -100,7 +102,11 @@ static_assert(sizeof(INode) == kINodeSize);
 
 struct DirectoryEntry {
   int64_t inode;
-  int8_t name_length;
+  // Number of bytes needed to advance from here to the next entry
+  int16_t alloc_length;
+
+  // Length of name
+  uint8_t name_length;
   char name[];
 };
 
@@ -116,13 +122,13 @@ class Fileosophy;
 
 struct CachedINode {
   CachedINode(int64_t inode, INode* data, PinnedBlock block, Fileosophy* fs)
-      : inode(inode),
+      : inode_(inode),
         data(data),
         block(block),
         fs(fs),
         block_group(GroupOfInode(inode)) {}
 
-  int64_t inode;
+  int64_t inode_;
   INode* data;
   PinnedBlock block;
   Fileosophy* fs = nullptr;
@@ -149,6 +155,12 @@ struct CachedINode {
   void read(std::span<uint8_t> out, int64_t offset);
 
   void write(std::span<const uint8_t> in, int64_t offset);
+
+  // Returns true if added, false if filename already exists (no modification)
+  bool AddDirectoryEntry(std::string_view filename, int64_t inode);
+
+  // Returns true if unlinked, false if entry didn't exist
+  bool Unlink(std::string_view filename);
 };
 
 struct CachedDirectory {

@@ -66,6 +66,11 @@ void Fileosophy::MakeFS() {
 
     blocks_->WriteBlock(block_group->block_bitmap, kEmptyBlock, 0);
     blocks_->WriteBlock(block_group->inode_bitmap, kEmptyBlock, 0);
+
+    // Mark inodes 0 and 1 occupied
+    if (block_group_descriptor == 0) {
+      blocks_->WriteU8(block_group->inode_bitmap, 0b11, 0);
+    }
   }
 
   first_data_block_ =
@@ -74,11 +79,12 @@ void Fileosophy::MakeFS() {
 
 void Fileosophy::MakeRootDirectory() {
   auto inode = NewINode(0);
-  CHECK_EQ(inode.inode, 0) << "Root should have inode 0";
+  CHECK_EQ(inode.inode_, kRootInode) << "Root should have inode " << kRootInode;
   using namespace flags;
   InitINode(inode.data, Mode::kDirectory,
             kUsrR | kUsrW | kUsrX | kGrpR | kGrpX | kOthR | kOthX, 0, 0);
-  GrowINode(&inode, 4096 * 12);
+  CHECK(inode.AddDirectoryEntry(".", inode.inode_));
+  CHECK(inode.AddDirectoryEntry("..", inode.inode_));
 }
 
 CachedINode Fileosophy::GetINode(int64_t inode) {
@@ -200,6 +206,7 @@ CachedINode Fileosophy::NewINode(int32_t group_hint) {
   auto res = try_group(group_hint);
   if (res) {
     LOG(INFO) << "Allocated inode " << *res << " in group " << group_hint;
+    CHECK_NE(*res, 0) << "Should not allocate inode 0";
     return GetINode(*res);
   }
 
@@ -208,6 +215,7 @@ CachedINode Fileosophy::NewINode(int32_t group_hint) {
     res = try_group(group_i);
     if (res) {
       LOG(INFO) << "Allocated inode " << *res << " in group " << group_i;
+      CHECK_NE(*res, 0) << "Should not allocate inode 0";
       return GetINode(*res);
     }
   }
@@ -265,7 +273,7 @@ void Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
   for (int64_t blk = num_blocks; blk < new_num_blocks; ++blk) {
     auto new_blk = NewFreeBlock(hint);
     CHECK(new_blk.has_value());
-    LOG(INFO) << "Inode " << inode->inode << " allocate new block " << *new_blk
+    LOG(INFO) << "Inode " << inode->inode_ << " allocate new block " << *new_blk
               << " hint " << hint;
     blocks_->WriteBlock(*new_blk, kEmptyBlock);
     inode->set_block(blk, *new_blk);
@@ -443,6 +451,135 @@ void CachedINode::write(std::span<const uint8_t> in, int64_t offset) {
         LOG(INFO) << "Write to " << blk << " " << d.size();
         fs->blocks_->WriteBlock(blk, d, start);
       });
+}
+
+// Add a new directory entry, first by attempting to borrow an existing entry,
+// if not by appending. Directory entries cannot span blocks.
+bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode) {
+  int32_t blknum = 0;
+  const int32_t nblocks = num_blocks();
+
+  CHECK_LE(filename.size(), kFilenameLen);
+  CHECK_GE(inode, 2);
+
+  const int16_t bytes_needed = sizeof(DirectoryEntry) + filename.size();
+
+  // First try to find an existing block to borrow
+  while (blknum != nblocks) {
+    auto blki = get_block(blknum);
+    auto blk = fs->blocks_->LockBlock(blki);
+    auto blkdata = blk.data_mutable().data();
+    auto end = blk.data_mutable().data() + kBlockSize;
+
+    do {
+      DirectoryEntry* de = reinterpret_cast<DirectoryEntry*>(blkdata);
+      DirectoryEntry* new_entry = nullptr;
+
+      if (de->inode == 0) {
+        if (de->alloc_length >= bytes_needed) {
+          // Take over this entry
+          new_entry = de;
+
+          // Check alignment is correct (it should be)
+          CHECK_EQ(reinterpret_cast<uintptr_t>(de) % 8, 0);
+        }
+      } else {
+        // Try to split entry
+
+        if (std::string_view(de->name, de->name_length) == filename) {
+          // Filename already exists
+          return false;
+        }
+
+        const auto de_effective_size = de->name_length + sizeof(DirectoryEntry);
+
+        void* new_de_start = blkdata + de_effective_size;
+        std::size_t space = de->alloc_length - de_effective_size;
+
+        if (std::align(8, bytes_needed, new_de_start, space)) {
+          // We can split this entry
+          new_entry = reinterpret_cast<DirectoryEntry*>(new_de_start);
+
+          // New entry takes all the remaining size
+          new_entry->alloc_length = space;
+
+          // Old entry is resized to its name length + space used for padding
+          de->alloc_length =
+              reinterpret_cast<const uint8_t*>(new_de_start) - blkdata;
+        }
+      }
+
+      if (new_entry) {
+        new_entry->inode = inode;
+        new_entry->name_length = filename.length();
+        memcpy(new_entry->name, filename.data(), filename.size());
+        return true;
+      }
+
+      blkdata += de->alloc_length;
+    } while (blkdata != end);
+
+    ++blknum;
+  }
+
+  // Couldn't allocate in an existing region, add a new block
+  fs->GrowINode(this, data->size + kBlockSize);
+  auto blk = fs->blocks_->LockBlock(get_block(nblocks));
+
+  DirectoryEntry* new_entry =
+      reinterpret_cast<DirectoryEntry*>(blk.data_mutable().data());
+  new_entry->inode = inode;
+  new_entry->alloc_length = kBlockSize;
+  new_entry->name_length = filename.length();
+  memcpy(new_entry->name, filename.data(), filename.size());
+
+  return true;
+}
+
+bool CachedINode::Unlink(std::string_view filename) {
+  int32_t blknum = 0;
+  const int32_t nblocks = num_blocks();
+
+  CHECK_LE(filename.size(), kFilenameLen);
+
+  // First try to find an existing block to borrow
+  while (blknum != nblocks) {
+    auto blki = get_block(blknum);
+    auto blk = fs->blocks_->LockBlock(blki);
+    auto blkdata = blk.data_mutable().data();
+    auto end = blk.data_mutable().data() + kBlockSize;
+
+    DirectoryEntry* prev = nullptr;
+
+    do {
+      DirectoryEntry* de = reinterpret_cast<DirectoryEntry*>(blkdata);
+
+      if (std::string_view(de->name, de->name_length) == filename) {
+        // Found file
+
+        // Outcomes:
+        if (prev) {
+          // 1. This entry follows an entry, merge into previous
+          prev->alloc_length += de->alloc_length;
+        } else {
+          // 2. This is the 1st entry in the block, mark unused by setting inode
+          // to 0
+          de->inode = 0;
+        }
+        // 3. This entry is the 1st and only, delete the block (not handled yet
+        // since we need a way to shuffle all following entries down)
+
+        return true;
+      }
+
+      blkdata += de->alloc_length;
+      prev = de;
+    } while (blkdata != end);
+
+    ++blknum;
+  }
+
+  return false;
 }
 
 int64_t Fileosophy::LookupIndirect(const int64_t indirect_list,
