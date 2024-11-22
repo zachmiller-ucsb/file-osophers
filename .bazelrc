@@ -1,1 +1,7 @@
-build --copt=-Wall --copt=-Werror --cxxopt=-std=c++20
+build --copt=-Wall
+build --copt=-Wpedantic
+build --copt=-Wextra
+build --copt=-Wno-c99-extensions
+build --copt=-Werror
+build --copt=-g3
+build --cxxopt=-std=c++20

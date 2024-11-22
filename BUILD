@@ -38,3 +38,17 @@ cc_library(
     hdrs = ["macros.h"],
     deps = ["@glog"],
 )
+
+cc_binary(
+    name = "fuse",
+    srcs = ["fuse.cc"],
+    defines = [
+        "_FILE_OFFSET_BITS=64",
+        "FUSE_USE_VERSION=31",
+    ],
+    deps = [
+        ":block",
+        ":fs",
+        "@fuse",
+    ],
+)

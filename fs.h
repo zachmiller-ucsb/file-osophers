@@ -1,5 +1,8 @@
-#ifndef FS_H_
-#define FS_H_
+#ifndef FILEOSOPHY_FS_H_
+#define FILEOSOPHY_FS_H_
+
+#include <sys/stat.h>
+#include <sys/uio.h>
 
 #include <optional>
 
@@ -19,7 +22,7 @@ constexpr int kNumBlocksPerTripleIndirect =
     kNumBlocksPerIndirect * kNumBlocksPerIndirect * kNumBlocksPerIndirect;
 
 constexpr int64_t kSuperblockBlock = 0;
-constexpr int64_t kRootInode = 2;
+constexpr int64_t kRootInode = 1;
 
 constexpr int kBlockGroupDescriptorSize = 32;
 constexpr int kDataBlocksPerBlockGroup = kBlockSize;
@@ -36,6 +39,10 @@ constexpr int kNonDataBlocksPerBlockGroup = 1 /* block bitmap */ +
 constexpr int kTotalBlocksPerBlockGroup =
     1 /* block bitmap */ + 1 /* inode bitmap */ +
     kINodeTableBlocksPerBlockGroup + kDataBlocksPerBlockGroup;
+
+constexpr int kMaxReadSize = 128 * 1024;  // 128K
+// +1 because a read might not be block aligned
+constexpr int kMaxReadBlocks = divide_round_up(kMaxReadSize, kBlockSize) + 1;
 
 constexpr int kFilenameLen = 255;
 
@@ -59,7 +66,7 @@ struct BlockGroupDescriptor {
 
 static_assert(sizeof(BlockGroupDescriptor) == kBlockGroupDescriptorSize);
 
-enum class Mode : int8_t { kUnknown, kRegular, kDirectory };
+enum class Type : int8_t { kUnknown, kRegular, kDirectory };
 
 namespace flags {
 constexpr uint16_t kUsrR = 0x1;
@@ -73,10 +80,92 @@ constexpr uint16_t kOthW = 0x80;
 constexpr uint16_t kOthX = 0x100;
 constexpr uint16_t kSetUid = 0x200;
 constexpr uint16_t kSetGid = 0x400;
+constexpr uint16_t kSticky = 0x800;
 }  // namespace flags
 
+inline bool ModeToType(mode_t mode, Type* type) {
+  if (S_ISREG(mode)) {
+    *type = Type::kRegular;
+  } else if (S_ISDIR(mode)) {
+    *type = Type::kDirectory;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+inline bool TypeToMode(Type type, mode_t* mode) {
+  switch (type) {
+    case Type::kRegular:
+      *mode |= S_IFREG;
+      break;
+    case Type::kDirectory:
+      *mode |= S_IFDIR;
+      break;
+    default:
+      return false;
+  }
+  return true;
+}
+
+// Returns true on success, false otherwise
+inline bool ModeToFlags(mode_t mode, Type* type, int16_t* flags) {
+  *flags = 0;
+  if (!ModeToType(mode, type)) {
+    return false;
+  }
+
+  auto map = [mode, flags](mode_t f1, uint16_t f2) {
+    if (mode & f1) *flags |= f2;
+  };
+
+  using namespace flags;
+  map(S_IRUSR, kUsrR);
+  map(S_IWUSR, kUsrW);
+  map(S_IXUSR, kUsrX);
+  map(S_IRGRP, kGrpR);
+  map(S_IWGRP, kGrpW);
+  map(S_IXGRP, kGrpX);
+  map(S_IROTH, kOthR);
+  map(S_IWOTH, kOthW);
+  map(S_IXOTH, kOthX);
+  map(S_ISUID, kSetUid);
+  map(S_ISGID, kSetGid);
+  map(S_ISVTX, kSticky);
+
+  return true;
+}
+
+// Returns true on success, false otherwise
+inline bool FlagsToMode(Type type, int16_t flags, mode_t* mode) {
+  *mode = 0;
+  if (!TypeToMode(type, mode)) {
+    return false;
+  }
+
+  auto map = [mode, flags](mode_t f2, uint16_t f1) {
+    if (flags & f1) *mode |= f2;
+  };
+
+  using namespace flags;
+  map(S_IRUSR, kUsrR);
+  map(S_IWUSR, kUsrW);
+  map(S_IXUSR, kUsrX);
+  map(S_IRGRP, kGrpR);
+  map(S_IWGRP, kGrpW);
+  map(S_IXGRP, kGrpX);
+  map(S_IROTH, kOthR);
+  map(S_IWOTH, kOthW);
+  map(S_IXOTH, kOthX);
+  map(S_ISUID, kSetUid);
+  map(S_ISGID, kSetGid);
+  map(S_ISVTX, kSticky);
+
+  return true;
+}
+
 struct INode {
-  Mode mode;
+  Type mode;
   int64_t size;
   int16_t flags;
   int32_t uid;
@@ -107,6 +196,7 @@ struct DirectoryEntry {
 
   // Length of name
   uint8_t name_length;
+  Type type;
   char name[];
 };
 
@@ -123,19 +213,24 @@ class Fileosophy;
 struct CachedINode {
   CachedINode(int64_t inode, INode* data, PinnedBlock block, Fileosophy* fs)
       : inode_(inode),
-        data(data),
-        block(block),
+        data_(data),
+        block_(block),
         fs(fs),
-        block_group(GroupOfInode(inode)) {}
+        block_group_(GroupOfInode(inode)) {}
+
+  ~CachedINode();
+
+  CachedINode(CachedINode&&) = delete;
 
   int64_t inode_;
-  INode* data;
-  PinnedBlock block;
+  INode* data_;
+  PinnedBlock block_;
   Fileosophy* fs = nullptr;
-  const int64_t block_group;
+  const int64_t block_group_;
+  int32_t lookups_ = 0;
 
   int64_t num_blocks() const {
-    return divide_round_up<int64_t>(data->size, kBlockSize);
+    return divide_round_up<int64_t>(data_->size, kBlockSize);
   }
 
   int64_t get_block(int64_t block_index);
@@ -154,13 +249,25 @@ struct CachedINode {
 
   void read(std::span<uint8_t> out, int64_t offset);
 
+  void read_iovec(int64_t size, int64_t offset,
+                  std::function<void(std::span<iovec>)> outs);
+
   void write(std::span<const uint8_t> in, int64_t offset);
 
   // Returns true if added, false if filename already exists (no modification)
-  bool AddDirectoryEntry(std::string_view filename, int64_t inode);
+  bool AddDirectoryEntry(std::string_view filename, int64_t inode, Type type);
 
   // Returns true if unlinked, false if entry didn't exist
   bool Unlink(std::string_view filename);
+
+  CachedINode* LookupFile(std::string_view filename);
+
+  // Reads entries until callback returns false. To resume, invoke with off
+  // returned by previous call.
+  void ReadDir(off_t off,
+               std::function<bool(const DirectoryEntry*, off_t)> callback);
+
+  void FillStat(struct stat* attr);
 };
 
 struct CachedDirectory {
@@ -176,26 +283,29 @@ class Fileosophy {
 
   void MakeFS();
 
-  void MakeRootDirectory();
+  void MakeRootDirectory(uid_t uid, gid_t gid);
 
   std::pair<PinnedBlock, BlockGroupDescriptor*> GetBlockGroupDescriptor(
       int descriptor_num);
 
-  CachedINode GetINode(int64_t inode);
+  CachedINode* GetINode(int64_t inode);
 
-  CachedINode NewINode(int32_t hint);
+  CachedINode* NewINode(int32_t hint);
 
- private:
-  void InitINode(INode* inode, Mode mode, int16_t flags, int32_t uid,
+  void ForgetInode(int64_t inode, uint64_t nlookup);
+
+  void InitINode(INode* inode, Type mode, int16_t flags, int32_t uid,
                  int32_t gid);
 
   // Finds a new free block relative to hint. Hint is an absolute
   // block number
   std::optional<int64_t> NewFreeBlock(int64_t hint);
 
-  void GrowINode(CachedINode* inode, int64_t new_size);
+  [[nodiscard]] bool GrowINode(CachedINode* inode, int64_t new_size);
 
   void ShrinkINode(int64_t inode);
+
+  void ReleaseBlock(int64_t block);
 
   // Finds a free block in this group
   // group_i: group no to search in
@@ -220,6 +330,10 @@ class Fileosophy {
     return (block - first_data_block_) / kDataBlocksPerBlockGroup;
   }
 
+  int64_t DataBlockToGroupLocalBlock(int64_t block) const {
+    return (block - first_data_block_) % kDataBlocksPerBlockGroup;
+  }
+
   // Returns the block number from an indirect array
   // block is position in blocks from the start of the file, not an
   // absolute block number.
@@ -240,6 +354,8 @@ class Fileosophy {
   int64_t first_data_block_;
 
   friend struct CachedINode;
+
+  std::unordered_map<int64_t, CachedINode> opened_files_;
 };
 
-#endif  // FS_H_
+#endif  // FILEOSOPHY_FS_H_

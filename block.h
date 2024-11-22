@@ -1,5 +1,5 @@
-#ifndef BLOCK_H_
-#define BLOCK_H_
+#ifndef FILEOSOPHY_BLOCK_H_
+#define FILEOSOPHY_BLOCK_H_
 
 #include <cstdint>
 #include <memory>
@@ -48,7 +48,14 @@ class PinnedBlock {
 
   PinnedBlock(Block* block);
 
-  ~PinnedBlock();
+  PinnedBlock(const PinnedBlock& p) : PinnedBlock(p.block_) {}
+  PinnedBlock& operator=(const PinnedBlock& p) {
+    reset(p.block_);
+    return *this;
+  }
+  PinnedBlock(PinnedBlock&&) = default;
+
+  ~PinnedBlock() { release(); }
 
   auto data() { return block_->data(); }
   auto data_mutable() { return block_->data_mutable(); }
@@ -63,6 +70,9 @@ class PinnedBlock {
   }
 
  private:
+  void reset(Block* block);
+  void release();
+
   Block* block_;
 };
 
@@ -90,6 +100,12 @@ class BlockCache {
   void WriteBlock(int64_t block, std::span<const uint8_t> src,
                   int64_t offset = 0);
 
+  void WriteU8(int64_t block, uint8_t data, int64_t offset) {
+    WriteBlock(block,
+               {reinterpret_cast<const uint8_t*>(&data), sizeof(uint8_t)},
+               offset * sizeof(uint8_t));
+  }
+
   void WriteI64(int64_t block, int64_t data, int64_t offset) {
     WriteBlock(block,
                {reinterpret_cast<const uint8_t*>(&data), sizeof(int64_t)},
@@ -114,4 +130,4 @@ class BlockCache {
   std::unordered_map<int64_t, Block> blocks_;
 };
 
-#endif  // BLOCK_H_
+#endif  // FILEOSOPHY_BLOCK_H_

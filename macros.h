@@ -1,5 +1,5 @@
-#ifndef MACROS_H_
-#define MACROS_H_
+#ifndef FILEOSOPHY_MACROS_H_
+#define FILEOSOPHY_MACROS_H_
 
 #include "glog/logging.h"
 
@@ -18,4 +18,4 @@ T CheckNotNullopt(const char* file, int line, const char* names,
   internal::CheckNotNullopt(__FILE__, __LINE__, \
                             "'" #val "' Must be non nullopt", (val))
 
-#endif  // MACROS_H_
+#endif  // FILEOSOPHY_MACROS_H_

@@ -50,9 +50,18 @@ void Block::RelinkInFrontOf(Block* next) {
 
 PinnedBlock::PinnedBlock(Block* block) : block_(block) { ++block_->ref_count_; }
 
-PinnedBlock::~PinnedBlock() {
+void PinnedBlock::reset(Block* block) {
+  release();
+  if (block) {
+    block_ = block;
+    ++block_->ref_count_;
+  }
+}
+
+void PinnedBlock::release() {
   if (block_) {
     --block_->ref_count_;
+    block_ = nullptr;
   }
 }
 
@@ -105,7 +114,7 @@ void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
   loaded_block->RelinkInFrontOf(lru_head_);
   lru_head_ = loaded_block;
 
-  //PrintLRU(LOG(INFO));
+  // PrintLRU(LOG(INFO));
 }
 
 void BlockCache::WriteBlock(int64_t block, std::span<const uint8_t> src,
@@ -119,7 +128,7 @@ void BlockCache::WriteBlock(int64_t block, std::span<const uint8_t> src,
   loaded_block->RelinkInFrontOf(lru_head_);
   lru_head_ = loaded_block;
 
-  //PrintLRU(LOG(INFO));
+  // PrintLRU(LOG(INFO));
 }
 
 Block* BlockCache::LoadBlockToCache(int64_t block) {
@@ -129,7 +138,8 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
     return &blk->second;
   }
 
-  PCHECK(lseek(fd_, block * kBlockSize, SEEK_SET) != -1)
+  const off_t off = block * kBlockSize;
+  PCHECK(lseek(fd_, off, SEEK_SET) != -1)
       << "Failed to seek to block " << block;
 
   CHECK_EQ(std::ssize(blk->second.data_mutable()), kBlockSize);
@@ -137,7 +147,7 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
       read(fd_, blk->second.data_mutable().data(), kBlockSize);
   PCHECK(bytes_read == kBlockSize)
       << "Failed to read " << kBlockSize << " bytes from block " << block
-      << ", got " << bytes_read;
+      << " at " << off << ", got " << bytes_read;
 
   lru_head_ = &blk->second;
 
@@ -145,7 +155,7 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
 }
 
 void BlockCache::Drop(int64_t block) {
-  //PrintLRU(LOG(INFO));
+  // PrintLRU(LOG(INFO));
   auto search = blocks_.find(block);
   CHECK(search != blocks_.end());
 
