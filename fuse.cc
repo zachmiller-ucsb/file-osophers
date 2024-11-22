@@ -14,6 +14,9 @@ void create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
   auto ctx = fuse_req_ctx(req);
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
 
+  LOG(INFO) << "create(" << parent << ", \"" << name << "\", " << std::hex
+            << mode << ")";
+
   int16_t flags;
   Type type;
   if (!ModeToFlags(mode, &type, &flags)) {
@@ -52,11 +55,23 @@ void create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
   CHECK_EQ(fuse_reply_create(req, &e, fi), 0);
 }
 
-void destroy(void* /* userdata */) { LOG(INFO) << "Destroyed"; }
+void destroy(void* userdata) {
+  LOG(INFO) << "Shutdown";
+
+  auto fs = reinterpret_cast<Fileosophy*>(userdata);
+
+  // Fuse doesn't guarantee that all lookups will be removed on unmount
+  for (auto& [i, p] : fs->opened_files_) {
+    p.lookups_ = 0;
+  }
+}
 
 void fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
                off_t length, struct fuse_file_info* /* fi */) {
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+
+  LOG(INFO) << "fallocate(" << ino << ", " << std::hex << mode << ", " << offset
+            << ", " << length << ")";
 
   if (mode != 0) {
     // Only support fallocate in an ftruncate-like mode
@@ -93,7 +108,8 @@ void forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup) {
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
   fs->ForgetInode(ino, nlookup);
 
-  CHECK_EQ(fuse_reply_err(req, 0), 0);
+  LOG(INFO) << "Forget " << ino << ' ' << nlookup;
+  fuse_reply_none(req);
 }
 
 void fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
@@ -151,6 +167,9 @@ void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
 
 void open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+
+  LOG(INFO) << "open(" << ino << ", " << std::hex << fi->flags << ")";
+
   auto inode = fs->GetINode(ino);
   if (inode->data_->mode == Type::kDirectory) {
     CHECK_EQ(fuse_reply_err(req, ENOSYS), 0);
@@ -208,6 +227,79 @@ void read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     }
     CHECK_EQ(fuse_reply_iov(req, vec.data(), vec.size()), 0);
   });
+}
+
+void setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
+             struct fuse_file_info* /* fi */) {
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+  auto inode = fs->GetINode(ino);
+
+  inode->data_->flags &= ~(flags::kSetUid | flags::kSetGid);
+
+  if (to_set & FUSE_SET_ATTR_SIZE) {
+    // This can fail, so try it first
+    if (!fs->TruncateINode(inode, attr->st_size)) {
+      CHECK_EQ(fuse_reply_err(req, ENOSPC), 0);
+    }
+  }
+  if (to_set & FUSE_SET_ATTR_MODE) {
+    Type type;
+    int16_t flags;
+    ModeToFlags(attr->st_mode, &type, &flags);
+    CHECK(type == inode->data_->mode);
+    inode->data_->flags = flags;
+  }
+  if (to_set & FUSE_SET_ATTR_UID) {
+    inode->data_->uid = attr->st_uid;
+  }
+  if (to_set & FUSE_SET_ATTR_GID) {
+    inode->data_->gid = attr->st_gid;
+  }
+  if (to_set & FUSE_SET_ATTR_ATIME) {
+    inode->data_->atime = attr->st_atime;
+  }
+  if (to_set & FUSE_SET_ATTR_MTIME) {
+    inode->data_->mtime = attr->st_mtime;
+  }
+  if (to_set & (FUSE_SET_ATTR_ATIME_NOW | FUSE_SET_ATTR_MTIME_NOW)) {
+    auto t = time(nullptr);
+    if (to_set & FUSE_SET_ATTR_ATIME_NOW) {
+      inode->data_->atime = t;
+    }
+    if (to_set & FUSE_SET_ATTR_MTIME_NOW) {
+      inode->data_->mtime = t;
+    }
+  }
+
+  struct stat new_attr;
+  inode->FillStat(&new_attr);
+
+  CHECK_EQ(fuse_reply_attr(req, &new_attr, 0.0), 0);
+}
+
+void unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+  auto p = fs->GetINode(parent);
+
+  LOG(INFO) << "unlink(" << parent << ", " << name << ")";
+
+  if (p->data_->mode != Type::kDirectory) {
+    CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
+    return;
+  }
+
+  auto ino = p->RemoveDE(name);
+  if (!ino.has_value()) {
+    CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
+    return;
+  }
+
+  auto inode = fs->GetINode(*ino);
+  // Sanity check, we should use rmdir otherwise
+  CHECK(inode->data_->mode == Type::kRegular);
+
+  CHECK_GE(--inode->data_->link_count, 0) << "link_count < 0?";
+  CHECK_EQ(fuse_reply_err(req, 0), 0);
 }
 
 void write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
@@ -271,9 +363,10 @@ void readdir(fuse_req_t req, fuse_ino_t ino, const size_t size, const off_t off,
 
 static const struct fuse_lowlevel_ops fileosophy_ops {
   .init = nullptr, .destroy = fuse_ops::destroy, .lookup = fuse_ops::lookup,
-  .forget = fuse_ops::forget, .getattr = fuse_ops::getattr, .setattr = nullptr,
-  .readlink = nullptr, .mknod = nullptr, .mkdir = nullptr, .unlink = nullptr,
-  .rmdir = nullptr, .symlink = nullptr, .rename = nullptr, .link = nullptr,
+  .forget = fuse_ops::forget, .getattr = fuse_ops::getattr,
+  .setattr = fuse_ops::setattr, .readlink = nullptr, .mknod = nullptr,
+  .mkdir = nullptr, .unlink = fuse_ops::unlink, .rmdir = nullptr,
+  .symlink = nullptr, .rename = nullptr, .link = nullptr,
   .open = fuse_ops::open, .read = fuse_ops::read, .write = fuse_ops::write,
   .flush = fuse_ops::flush, .fsync = fuse_ops::fsync,
   .opendir = fuse_ops::opendir, .readdir = fuse_ops::readdir,

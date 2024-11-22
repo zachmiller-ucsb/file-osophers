@@ -96,8 +96,8 @@ void Fileosophy::MakeRootDirectory(uid_t uid, gid_t gid) {
   using namespace flags;
   InitINode(inode->data_, Type::kDirectory,
             kUsrR | kUsrW | kUsrX | kGrpR | kGrpX | kOthR | kOthX, uid, gid);
-  //CHECK(inode->AddDirectoryEntry(".", inode->inode_, Type::kDirectory));
-  //CHECK(inode->AddDirectoryEntry("..", inode->inode_, Type::kDirectory));
+  CHECK(inode->AddDirectoryEntry(".", inode->inode_, Type::kDirectory));
+  CHECK(inode->AddDirectoryEntry("..", inode->inode_, Type::kDirectory));
   inode->data_->link_count = 2;
 }
 
@@ -288,11 +288,21 @@ Fileosophy::GetBlockGroupDescriptor(int descriptor_num) {
       block_group_table_blk
           .data_as<BlockGroupDescriptor[kBlockGroupDescriptorsPerTable]>();
 
-  LOG(INFO) << block_group_descriptor_table << " "
-            << (descriptor_num % kBlockGroupDescriptorsPerTable);
   return {
       block_group_table_blk,
       &(*block_group_table)[descriptor_num % kBlockGroupDescriptorsPerTable]};
+}
+
+bool Fileosophy::TruncateINode(CachedINode* inode, int64_t new_size) {
+  const auto old_size = inode->data_->size;
+  if (new_size == old_size) {
+    return true;
+  } else if (new_size > old_size) {
+    return GrowINode(inode, new_size);
+  } else {
+    ShrinkINode(inode, new_size);
+    return true;
+  }
 }
 
 bool Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
@@ -319,13 +329,42 @@ bool Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
     LOG(INFO) << "Inode " << inode->inode_ << " allocate new block " << *new_blk
               << " hint " << hint;
     blocks_->WriteBlock(*new_blk, kEmptyBlock);
-    inode->set_block(blk, *new_blk);
+    CHECK_EQ(inode->set_block(blk, *new_blk), 0);
     hint = *new_blk + 1;
   }
 
   inode->data_->size = new_size;
 
   return true;
+}
+
+void Fileosophy::ShrinkINode(CachedINode* inode, int64_t new_size) {
+  CHECK_LT(new_size, inode->data_->size);
+  CHECK_GE(new_size, 0);
+
+  const int64_t num_blocks = inode->num_blocks();
+  const int64_t new_num_blocks = divide_round_up<int64_t>(new_size, kBlockSize);
+
+  // Free all unused blocks
+  // TODO: Free indirect lists as well
+  for (int64_t blk = new_num_blocks; blk != num_blocks; ++blk) {
+    // LOG(INFO) << blk << ' ' << num_blocks;
+    ReleaseBlock(inode->set_block(blk, 0));
+  }
+
+  if (new_num_blocks > 0) {
+    // Zero out remaining portion of last block
+    const int64_t unused_size = (new_num_blocks * kBlockSize) - new_size;
+    LOG(INFO) << "Shrink " << new_num_blocks << ' ' << unused_size;
+    if (unused_size != 0) {
+      auto blk = inode->get_block(new_num_blocks - 1);
+      auto p = blocks_->LockBlock(blk);
+      auto data = p.data_mutable();
+      std::fill_n(&data[kBlockSize - unused_size], unused_size, 0);
+    }
+  }
+
+  inode->data_->size = new_size;
 }
 
 void Fileosophy::ReleaseBlock(int64_t block) {
@@ -342,6 +381,33 @@ void Fileosophy::ReleaseBlock(int64_t block) {
 
   ++group->unallocated_blocks_count;
   ++super_->unallocated_blocks_count;
+}
+
+void Fileosophy::DeleteINodeAndBlocks(CachedINode* inode) {
+  CHECK_EQ(inode->data_->link_count, 0);
+  CHECK_EQ(inode->lookups_, 0);
+
+  // Restore inode to group
+  auto [p, g] = GetBlockGroupDescriptor(inode->block_group_);
+  ++g->unallocated_inodes_count;
+  ++super_->unallocated_inodes_count;
+
+  // Cleanup bitmap
+  auto bitmap = blocks_->LockBlock(g->inode_bitmap);
+  ReleaseInBitmap(bitmap.data_mutable(), inode->inode_ % kINodesPerBlockGroup);
+  bitmap.set_modified();
+
+  // Cleanup inode itself
+  inode->data_->mode = Type::kUnknown;
+  inode->data_->size = 0;
+
+  for (int64_t b : inode->data_->direct_blocks) {
+    if (b) ReleaseBlock(b);
+  }
+
+  FreeIndirect(inode->data_->single_indirect, 1);
+  FreeIndirect(inode->data_->double_indirect, 2);
+  FreeIndirect(inode->data_->triple_indirect, 3);
 }
 
 std::optional<int64_t> Fileosophy::FindFreeBlockInBlockGroup(
@@ -397,7 +463,7 @@ std::optional<int64_t> Fileosophy::NewFreeBlock(int64_t hint) {
 CachedINode::~CachedINode() {
   CHECK_EQ(lookups_, 0) << "Shouldn't remove inode with lookups";
   if (data_->link_count == 0) {
-    LOG(FATAL) << "TODO: unlink";
+    fs->DeleteINodeAndBlocks(this);
   }
 }
 
@@ -427,31 +493,36 @@ int64_t CachedINode::get_block(int64_t block_index) {
   LOG(FATAL) << "Block index too large";
 }
 
-void CachedINode::set_block(int64_t block_index, int64_t block_no) {
+int64_t CachedINode::set_block(int64_t block_index, int64_t block_no) {
   if (block_index < kNumDirectBlocks) {
+    const int64_t old_block_no = data_->direct_blocks[block_index];
     data_->direct_blocks[block_index] = block_no;
-    return;
+    return old_block_no;
   }
 
+  int64_t old_block_no;
   block_index -= kNumDirectBlocks;
   if (block_index < kNumBlocksPerIndirect) {
-    data_->single_indirect = fs->WriteIndirect(
-        data_->single_indirect, get_hint(), block_index, block_no, 1);
-    return;
+    data_->single_indirect =
+        fs->WriteIndirect(data_->single_indirect, get_hint(), block_index,
+                          block_no, 1, &old_block_no);
+    return old_block_no;
   }
 
   block_index -= kNumBlocksPerIndirect;
   if (block_index < kNumBlocksPerDoubleIndirect) {
-    data_->double_indirect = fs->WriteIndirect(
-        data_->double_indirect, get_hint(), block_index, block_no, 2);
-    return;
+    data_->double_indirect =
+        fs->WriteIndirect(data_->double_indirect, get_hint(), block_index,
+                          block_no, 2, &old_block_no);
+    return old_block_no;
   }
 
   block_index -= kNumBlocksPerDoubleIndirect;
   if (block_index < kNumBlocksPerTripleIndirect) {
-    data_->triple_indirect = fs->WriteIndirect(
-        data_->triple_indirect, get_hint(), block_index, block_no, 3);
-    return;
+    data_->triple_indirect =
+        fs->WriteIndirect(data_->triple_indirect, get_hint(), block_index,
+                          block_no, 3, &old_block_no);
+    return old_block_no;
   }
 
   LOG(FATAL) << "Block index too large";
@@ -470,18 +541,21 @@ int64_t CachedINode::get_hint() {
 }
 
 namespace {
-void read_write_helper(const int64_t size, int64_t offset, auto&& op) {
+void read_write_helper(const int64_t size, const int64_t offset, auto&& op) {
   CHECK_GE(size, 0);
   CHECK_GE(offset, 0);
 
   const auto blk_start = offset / kBlockSize;
   const auto blk_end = divide_round_up<int64_t>(offset + size, kBlockSize);
 
+  const int64_t first_block_offset = offset % kBlockSize;
+
   int64_t bytes_read = 0;
   for (auto i = blk_start; i < blk_end; ++i) {
-    const auto local_start = (i == blk_start) ? (offset % kBlockSize) : 0;
-    const auto local_end =
-        (i == blk_end - 1) ? (size - bytes_read) : kBlockSize;
+    const auto local_start = (i == blk_start) ? first_block_offset : 0;
+    const auto local_end = (i == blk_end - 1)
+                               ? (size - bytes_read + first_block_offset)
+                               : kBlockSize;
     const auto local_size = local_end - local_start;
 
     op(i, bytes_read, local_size, local_start);
@@ -498,6 +572,7 @@ void CachedINode::read(std::span<uint8_t> out, int64_t offset) {
                     [this, out](int64_t block_i, int64_t bytes_read,
                                 int64_t local_size, int64_t start) {
                       auto blk = get_block(block_i);
+                      CHECK_NE(blk, 0);
                       fs->blocks_->CopyBlock(
                           blk, out.subspan(bytes_read, local_size), start);
                     });
@@ -515,6 +590,7 @@ void CachedINode::read_iovec(int64_t size, int64_t offset,
                                    int64_t local_size, int64_t start) {
         LOG(INFO) << block_i << ' ' << local_size << ' ' << start;
         auto blk = get_block(block_i);
+        CHECK_NE(blk, 0);
         auto p = fs->blocks_->LockBlock(blk);
         // TODO: We don't actually maintain the lock here
         out.push_back(
@@ -522,6 +598,7 @@ void CachedINode::read_iovec(int64_t size, int64_t offset,
              .iov_len = static_cast<size_t>(local_size)});
         pinned_blocks.push_back(std::move(p));
       });
+  CHECK_LE(std::ssize(out), kMaxReadBlocks);
   outs(out);
 }
 
@@ -533,6 +610,7 @@ void CachedINode::write(std::span<const uint8_t> in, int64_t offset) {
                     [this, in](int64_t block_i, int64_t bytes_read,
                                int64_t local_size, int64_t start) {
                       auto blk = get_block(block_i);
+                      CHECK_NE(blk, 0);
                       LOG(INFO) << "Write to " << blk << " " << local_size;
                       fs->blocks_->WriteBlock(
                           blk, in.subspan(bytes_read, local_size), start);
@@ -603,6 +681,7 @@ bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode,
         new_entry->name_length = filename.length();
         new_entry->type = type;
         memcpy(new_entry->name, filename.data(), filename.size());
+        blk.set_modified();
         return true;
       }
 
@@ -623,11 +702,12 @@ bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode,
   new_entry->name_length = filename.length();
   new_entry->type = type;
   memcpy(new_entry->name, filename.data(), filename.size());
+  blk.set_modified();
 
   return true;
 }
 
-bool CachedINode::Unlink(std::string_view filename) {
+std::optional<int64_t> CachedINode::RemoveDE(std::string_view filename) {
   CHECK(data_->mode == Type::kDirectory);
 
   int32_t blknum = 0;
@@ -650,6 +730,8 @@ bool CachedINode::Unlink(std::string_view filename) {
       if (std::string_view(de->name, de->name_length) == filename) {
         // Found file
 
+        const auto ino = de->inode;
+
         // Outcomes:
         if (prev) {
           // 1. This entry follows an entry, merge into previous
@@ -663,7 +745,9 @@ bool CachedINode::Unlink(std::string_view filename) {
         // 3. This entry is the 1st and only, delete the block (not handled yet
         // since we need a way to shuffle all following entries down)
 
-        return true;
+        blk.set_modified();
+
+        return ino;
       }
 
       blkdata += de->alloc_length;
@@ -673,7 +757,7 @@ bool CachedINode::Unlink(std::string_view filename) {
     ++blknum;
   }
 
-  return false;
+  return std::nullopt;
 }
 
 CachedINode* CachedINode::LookupFile(std::string_view filename) {
@@ -711,12 +795,13 @@ void CachedINode::ReadDir(
   while (blknum < nblocks) {
     auto blki = get_block(blknum);
     auto blk = fs->blocks_->LockBlock(blki);
-    const auto start = blk.data_mutable().data();
+    const auto start = blk.data().data();
     const auto end = start + kBlockSize;
     auto blkdata = start;
 
     do {
-      DirectoryEntry* de = reinterpret_cast<DirectoryEntry*>(blkdata);
+      const DirectoryEntry* de =
+          reinterpret_cast<const DirectoryEntry*>(blkdata);
       blkdata += de->alloc_length;
 
       if (blkdata - start < off_local) {
@@ -740,21 +825,28 @@ void CachedINode::ReadDir(
 }
 
 void CachedINode::FillStat(struct stat* attr) {
+  memset(attr, 0, sizeof(struct stat));
+
   attr->st_ino = inode_;
   CHECK(FlagsToMode(data_->mode, data_->flags, &attr->st_mode));
   attr->st_nlink = data_->link_count;
   attr->st_uid = data_->uid;
   attr->st_gid = data_->gid;
+#if __linux__
+  attr->st_atime = data_->atime;
+  attr->st_mtime = data_->mtime;
+  attr->st_ctime = data_->ctime;
+#elif __APPLE__
   attr->st_atimespec =
       timespec{.tv_sec = static_cast<long>(data_->atime), .tv_nsec = 0};
   attr->st_mtimespec =
       timespec{.tv_sec = static_cast<long>(data_->mtime), .tv_nsec = 0};
   attr->st_ctimespec =
       timespec{.tv_sec = static_cast<long>(data_->ctime), .tv_nsec = 0};
+#endif
   attr->st_size = data_->size;
   attr->st_blocks = num_blocks();
   attr->st_blksize = kBlockSize;
-  attr->st_gen = 1;
 }
 
 int64_t Fileosophy::LookupIndirect(const int64_t indirect_list,
@@ -768,9 +860,30 @@ int64_t Fileosophy::LookupIndirect(const int64_t indirect_list,
   return the_block;
 }
 
+void Fileosophy::FreeIndirect(const int64_t indirect_list, int depth) {
+  if (indirect_list == 0) {
+    return;
+  }
+
+  std::array<int64_t, kNumBlocksPerIndirect> list;
+  static_assert(sizeof(list) == kBlockSize);
+
+  blocks_->CopyBlock(indirect_list, list);
+
+  if (depth > 0) {
+    // This is an indirect list
+    for (int64_t b : list) {
+      FreeIndirect(b, depth - 1);
+    }
+  }
+
+  // Release current block (either a list, or a data block)
+  ReleaseBlock(indirect_list);
+}
+
 int64_t Fileosophy::WriteIndirect(int64_t indirect_list, int64_t hint,
                                   int64_t block_index, int64_t block_no,
-                                  int depth) {
+                                  int depth, int64_t* old_block_no) {
   if (indirect_list == 0) {
     // No indirect list, allocate a new one
     // TODO: Should this be relative to inode?
@@ -788,6 +901,10 @@ int64_t Fileosophy::WriteIndirect(int64_t indirect_list, int64_t hint,
     const int64_t local_block = block_index >> ((depth - 1 - i) * 9) & 0x1FF;
 
     if (i == depth - 1) {
+      if (old_block_no != nullptr) {
+        *old_block_no = blocks_->ReadI64(indirect_list, local_block);
+      }
+
       // Reached the end; write the block_no
       blocks_->WriteI64(indirect_list, block_no, local_block);
     } else {
@@ -799,6 +916,8 @@ int64_t Fileosophy::WriteIndirect(int64_t indirect_list, int64_t hint,
         blocks_->WriteI64(indirect_list, the_block, local_block);
         VLOG(1) << "Allocate new indirect block depth=" << i
                 << ", blk=" << indirect_list;
+        // Zero out the indirect list
+        blocks_->WriteBlock(the_block, kEmptyBlock);
       }
 
       indirect_list = the_block;

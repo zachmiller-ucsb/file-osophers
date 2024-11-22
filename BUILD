@@ -49,6 +49,6 @@ cc_binary(
     deps = [
         ":block",
         ":fs",
-        "@fuse",
+        "@fuse_linux//:fuse",
     ],
 )

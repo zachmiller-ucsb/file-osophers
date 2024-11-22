@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 
+#include <functional>
 #include <optional>
 
 #include "block.h"
@@ -197,7 +198,12 @@ struct DirectoryEntry {
   // Length of name
   uint8_t name_length;
   Type type;
+
+  // filename as an FLA
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
   char name[];
+#pragma GCC diagnostic pop
 };
 
 inline int64_t GroupOfInode(int64_t inode) {
@@ -235,7 +241,7 @@ struct CachedINode {
 
   int64_t get_block(int64_t block_index);
 
-  void set_block(int64_t block_index, int64_t block_no);
+  [[nodiscard]] int64_t set_block(int64_t block_index, int64_t block_no);
 
   std::optional<int64_t> get_last_block() {
     const int64_t blocks = num_blocks();
@@ -257,8 +263,9 @@ struct CachedINode {
   // Returns true if added, false if filename already exists (no modification)
   bool AddDirectoryEntry(std::string_view filename, int64_t inode, Type type);
 
-  // Returns true if unlinked, false if entry didn't exist
-  bool Unlink(std::string_view filename);
+  // Returns the inode if unlinked, null if not found
+  // Does NOT update link count of inode
+  std::optional<int64_t> RemoveDE(std::string_view filename);
 
   CachedINode* LookupFile(std::string_view filename);
 
@@ -301,11 +308,15 @@ class Fileosophy {
   // block number
   std::optional<int64_t> NewFreeBlock(int64_t hint);
 
+  [[nodiscard]] bool TruncateINode(CachedINode* inode, int64_t new_size);
+
   [[nodiscard]] bool GrowINode(CachedINode* inode, int64_t new_size);
 
-  void ShrinkINode(int64_t inode);
+  void ShrinkINode(CachedINode* inode, int64_t new_size);
 
   void ReleaseBlock(int64_t block);
+
+  void DeleteINodeAndBlocks(CachedINode* inode);
 
   // Finds a free block in this group
   // group_i: group no to search in
@@ -339,12 +350,15 @@ class Fileosophy {
   // absolute block number.
   int64_t LookupIndirect(int64_t indirect_list, int64_t block_index, int depth);
 
+  void FreeIndirect(int64_t indirect_list, int depth);
+
   // Writes block_no into the indirect list at position block_index.
   // Creates indirect arrays as needed, up to depth.
   // If indirect_list is 0, creates a new indirect list.
   // Returns the root of the indirect list.
   int64_t WriteIndirect(int64_t indirect_list, int64_t hint,
-                        int64_t block_index, int64_t block_no, int depth);
+                        int64_t block_index, int64_t block_no, int depth,
+                        int64_t* old_block_no);
 
   BlockCache* blocks_;
 

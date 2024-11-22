@@ -104,6 +104,14 @@ PinnedBlock BlockCache::LockBlock(int64_t block) {
   return PinnedBlock(loaded_block);
 }
 
+void BlockCache::CopyBlock(int64_t block, std::span<int64_t> dest,
+                           int64_t offset) {
+  CopyBlock(
+      block,
+      std::span(reinterpret_cast<uint8_t*>(dest.data()), dest.size_bytes()),
+      offset * sizeof(int64_t));
+}
+
 void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
                            int64_t offset) {
   CHECK_LE(offset + std::ssize(dest), kBlockSize);
@@ -168,7 +176,6 @@ void BlockCache::Drop(int64_t block) {
   blk->Unlink();
 
   if (blk->modified()) {
-    LOG(INFO) << reinterpret_cast<const int64_t*>(blk->data().data())[0];
     PCHECK(lseek(fd_, block * kBlockSize, SEEK_SET) != -1);
     PCHECK(write(fd_, blk->data().data(), kBlockSize) == kBlockSize);
   }

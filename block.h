@@ -69,6 +69,8 @@ class PinnedBlock {
     return reinterpret_cast<T*>(data.data());
   }
 
+  void set_modified() { block_->set_modified(); }
+
  private:
   void reset(Block* block);
   void release();
@@ -88,6 +90,7 @@ class BlockCache {
 
   PinnedBlock LockBlock(int64_t block);
 
+  void CopyBlock(int64_t block, std::span<int64_t> dest, int64_t offset = 0);
   void CopyBlock(int64_t block, std::span<uint8_t> dest, int64_t offset = 0);
 
   int64_t ReadI64(int64_t block, int64_t offset) {
