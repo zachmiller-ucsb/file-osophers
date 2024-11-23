@@ -653,7 +653,7 @@ bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode,
       } else {
         // Try to split entry
 
-        if (std::string_view(de->name, de->name_length) == filename) {
+        if (de->name_str() == filename) {
           // Filename already exists
           return false;
         }
@@ -727,7 +727,7 @@ std::optional<int64_t> CachedINode::RemoveDE(std::string_view filename) {
     do {
       DirectoryEntry* de = reinterpret_cast<DirectoryEntry*>(blkdata);
 
-      if (std::string_view(de->name, de->name_length) == filename) {
+      if (de->name_str() == filename) {
         // Found file
 
         const auto ino = de->inode;
@@ -766,7 +766,7 @@ CachedINode* CachedINode::LookupFile(std::string_view filename) {
 
   CachedINode* result = nullptr;
   ReadDir(0, [this, filename, &result](const DirectoryEntry* de, off_t) {
-    if (filename == std::string_view(de->name, de->name_length)) {
+    if (filename == de->name_str()) {
       result = fs->GetINode(de->inode);
       return false;
     } else {

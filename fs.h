@@ -204,6 +204,10 @@ struct DirectoryEntry {
 #pragma GCC diagnostic ignored "-Wpedantic"
   char name[];
 #pragma GCC diagnostic pop
+
+  std::string_view name_str() const {
+    return std::string_view(name, name_length);
+  }
 };
 
 inline int64_t GroupOfInode(int64_t inode) {
