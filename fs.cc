@@ -446,16 +446,32 @@ std::optional<int64_t> Fileosophy::NewFreeBlock(int64_t hint) {
 
   const int start_group_number = DataBlockToGroup(hint);
 
-  auto [p, group] = GetBlockGroupDescriptor(start_group_number);
+  std::optional<int64_t> new_block;
+  {
+    // First search local group
+    auto [p, group] = GetBlockGroupDescriptor(start_group_number);
 
-  const int64_t local_hint = DataBlockToGroupLocalBlock(hint);
-  CHECK_GE(hint, first_data_block_);
-  LOG(INFO) << start_group_number << ' ' << hint << ' ' << local_hint;
-  const auto new_block =
-      FindFreeBlockInBlockGroup(start_group_number, group, local_hint, true);
-  CHECK(new_block.has_value()) << "Could not find free block";
+    const int64_t local_hint = DataBlockToGroupLocalBlock(hint);
+    CHECK_GE(hint, first_data_block_);
+    LOG(INFO) << start_group_number << ' ' << hint << ' ' << local_hint;
+    new_block =
+        FindFreeBlockInBlockGroup(start_group_number, group, local_hint, true);
+  }
 
-  // TODO: Search other blocks
+  if (!new_block.has_value()) {
+    // Look for blocks in other groups
+    for (int32_t gi = 0; gi < super_->num_block_groups; ++gi) {
+      if (gi == start_group_number) continue;
+      auto [p, group] = GetBlockGroupDescriptor(gi);
+
+      new_block = FindFreeBlockInBlockGroup(gi, group, 0, true);
+      if (new_block.has_value()) {
+        break;
+      }
+    }
+  }
+
+  CHECK(new_block.has_value());
 
   return new_block;
 }
@@ -822,6 +838,21 @@ void CachedINode::ReadDir(
 
     ++blknum;
   }
+}
+
+bool CachedINode::IsEmpty() {
+  CHECK(data_->mode == Type::kDirectory);
+
+  bool is_empty = true;
+  ReadDir(0, [&is_empty](const DirectoryEntry* de, off_t) {
+    if (de->name_str() != "." && de->name_str() != "..") {
+      is_empty = false;
+      return false;
+    }
+    return true;
+  });
+
+  return is_empty;
 }
 
 void CachedINode::FillStat(struct stat* attr) {

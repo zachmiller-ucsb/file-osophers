@@ -278,6 +278,8 @@ struct CachedINode {
   void ReadDir(off_t off,
                std::function<bool(const DirectoryEntry*, off_t)> callback);
 
+  bool IsEmpty();
+
   void FillStat(struct stat* attr);
 };
 

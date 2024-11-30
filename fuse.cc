@@ -47,10 +47,9 @@ void create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
     inode = new_inode;
   }
 
-  struct fuse_entry_param e {
-    .ino = static_cast<fuse_ino_t>(inode->inode_), .generation = 1,
-    .attr_timeout = 0
-  };
+  struct fuse_entry_param e{.ino = static_cast<fuse_ino_t>(inode->inode_),
+                            .generation = 1,
+                            .attr_timeout = 0};
   inode->FillStat(&e.attr);
 
   ++inode->lookups_;
@@ -160,10 +159,9 @@ void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
     return;
   }
 
-  struct fuse_entry_param e {
-    .ino = static_cast<fuse_ino_t>(inode->inode_), .generation = 1,
-    .attr_timeout = 0
-  };
+  struct fuse_entry_param e{.ino = static_cast<fuse_ino_t>(inode->inode_),
+                            .generation = 1,
+                            .attr_timeout = 0};
   inode->FillStat(&e.attr);
 
   ++inode->lookups_;
@@ -217,10 +215,9 @@ void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
   CHECK(inode->AddDirectoryEntry("..", parent, type));
   ++parent_dir->data_->link_count;
 
-  struct fuse_entry_param e {
-    .ino = static_cast<fuse_ino_t>(inode->inode_), .generation = 1,
-    .attr_timeout = 0
-  };
+  struct fuse_entry_param e{.ino = static_cast<fuse_ino_t>(inode->inode_),
+                            .generation = 1,
+                            .attr_timeout = 0};
   inode->FillStat(&e.attr);
 
   ++inode->lookups_;
@@ -365,43 +362,23 @@ void unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
   CHECK_EQ(fuse_reply_err(req, 0), 0);
 }
 
-void rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
-  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
-
-  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-    CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
-    return;
-  }
-
-  auto p = fs->GetINode(parent);
-
+// Returns 0 on success, positive error code otherwise
+bool do_rmdir(CachedINode* p, const char* name) {
   if (p->data_->mode != Type::kDirectory) {
-    CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
-    return;
+    return EINVAL;
   }
 
   auto inode = p->LookupFile(name);
   if (inode == nullptr) {
-    CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
-    return;
+    return ENOENT;
   }
 
   // Sanity check, we should use unlink otherwise
   CHECK(inode->data_->mode == Type::kDirectory);
 
   // Check that directory is empty
-  bool is_empty = true;
-  inode->ReadDir(0, [&is_empty](const DirectoryEntry* de, off_t) {
-    if (de->name_str() != "." && de->name_str() != "..") {
-      is_empty = false;
-      return false;
-    }
-    return true;
-  });
-
-  if (!is_empty) {
-    CHECK_EQ(fuse_reply_err(req, ENOTEMPTY), 0);
-    return;
+  if (!inode->IsEmpty()) {
+    return ENOTEMPTY;
   }
 
   CHECK(p->RemoveDE(name).has_value());
@@ -412,6 +389,23 @@ void rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
   // Should be exactly 2 links at this point, since directory is empty
   CHECK_EQ(inode->data_->link_count, 2);
   inode->data_->link_count = 0;
+
+  return 0;
+}
+
+void rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+    CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
+    return;
+  }
+
+  auto p = fs->GetINode(parent);
+  if (int err = do_rmdir(p, name)) {
+    CHECK_EQ(fuse_reply_err(req, err), 0);
+    return;
+  }
 
   CHECK_EQ(fuse_reply_err(req, 0), 0);
 }
@@ -449,8 +443,8 @@ void readdir(fuse_req_t req, fuse_ino_t ino, const size_t size, const off_t off,
   size_t bytes_added = 0;
   inode->ReadDir(off, [&](const DirectoryEntry* de, off_t next_off) -> bool {
     // Fuse only cares about ino and type bits of mode
-    struct stat ministat {
-      .st_ino = static_cast<ino_t>(de->inode),
+    struct stat ministat{
+        .st_ino = static_cast<ino_t>(de->inode),
     };
     CHECK(TypeToMode(de->type, &ministat.st_mode));
 
@@ -473,18 +467,106 @@ void readdir(fuse_req_t req, fuse_ino_t ino, const size_t size, const off_t off,
   CHECK_EQ(fuse_reply_buf(req, fuse_direntries.data(), bytes_added), 0);
 }
 
+void rename(fuse_req_t req, fuse_ino_t parent, const char* name,
+            fuse_ino_t newparent,
+            const char* newname /*, unsigned int flags */) {
+  unsigned int flags = 0;
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+
+  if ((flags & RENAME_NOREPLACE) && (flags & RENAME_EXCHANGE)) {
+    // Flags are mutually exclusive
+    CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
+    return;
+  }
+
+  auto parent_dir = fs->GetINode(parent);
+  auto new_parent = fs->GetINode(newparent);
+  CHECK_EQ(static_cast<fuse_ino_t>(parent_dir->inode_), parent);
+  CHECK_EQ(static_cast<fuse_ino_t>(new_parent->inode_), newparent);
+
+  auto target_inode = new_parent->LookupFile(newname);
+  if ((flags & RENAME_NOREPLACE) && target_inode) {
+    // Don't overwrite target if it exists
+    CHECK_EQ(fuse_reply_err(req, EEXIST), 0);
+    return;
+  }
+
+  if ((flags & RENAME_EXCHANGE) && !target_inode) {
+    // Exchange requires that target exists
+    CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
+    return;
+  }
+
+  auto inode = parent_dir->LookupFile(name);
+  if (!inode) {
+    // Doesn't exist
+    CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
+    return;
+  }
+
+  if (target_inode) {
+    // Unlink target
+    if (target_inode->data_->mode == Type::kDirectory) {
+      const int err = do_rmdir(new_parent, newname);
+      if (err) {
+        CHECK_EQ(fuse_reply_err(req, err), 0);
+        return;
+      }
+    } else if (target_inode->data_->mode == Type::kRegular) {
+      CHECK(new_parent->RemoveDE(newname).has_value());
+      CHECK_GE(--target_inode->data_->link_count, 0) << "link_count < 0?";
+    } else {
+      LOG(FATAL) << "???";
+    }
+  }
+
+  // Remove entry from current directory
+  CHECK(parent_dir->RemoveDE(name).has_value());
+
+  // Add entry to new directory
+  CHECK(new_parent->AddDirectoryEntry(newname, inode->inode_,
+                                      inode->data_->mode));
+
+  if (parent != newparent && inode->data_->mode == Type::kDirectory) {
+    // If this is a directory and moving under a new parent, update ".."
+
+    // Remove link to old parent
+    CHECK_GE(--parent_dir->data_->link_count, 2);
+    CHECK(inode->RemoveDE("..").has_value());
+
+    // Add link to new parent
+    ++new_parent->data_->link_count;
+    CHECK(inode->AddDirectoryEntry("..", newparent, Type::kDirectory));
+  }
+
+  CHECK_EQ(fuse_reply_err(req, 0), 0);
+}
+
 }  // namespace fuse_ops
 
-static const struct fuse_lowlevel_ops fileosophy_ops {
-  .init = nullptr, .destroy = fuse_ops::destroy, .lookup = fuse_ops::lookup,
-  .forget = fuse_ops::forget, .getattr = fuse_ops::getattr,
-  .setattr = fuse_ops::setattr, .readlink = nullptr, .mknod = nullptr,
-  .mkdir = fuse_ops::mkdir, .unlink = fuse_ops::unlink,
-  .rmdir = fuse_ops::rmdir, .symlink = nullptr, .rename = nullptr,
-  .link = nullptr, .open = fuse_ops::open, .read = fuse_ops::read,
-  .write = fuse_ops::write, .flush = fuse_ops::flush, .fsync = fuse_ops::fsync,
-  .opendir = fuse_ops::opendir, .readdir = fuse_ops::readdir,
-  .create = fuse_ops::create,
+static const struct fuse_lowlevel_ops fileosophy_ops{
+    .init = nullptr,
+    .destroy = fuse_ops::destroy,
+    .lookup = fuse_ops::lookup,
+    .forget = fuse_ops::forget,
+    .getattr = fuse_ops::getattr,
+    .setattr = fuse_ops::setattr,
+    .readlink = nullptr,
+    .mknod = nullptr,
+    .mkdir = fuse_ops::mkdir,
+    .unlink = fuse_ops::unlink,
+    .rmdir = fuse_ops::rmdir,
+    .symlink = nullptr,
+    .rename = fuse_ops::rename,
+    .link = nullptr,
+    .open = fuse_ops::open,
+    .read = fuse_ops::read,
+    .write = fuse_ops::write,
+    .flush = fuse_ops::flush,
+    .fsync = fuse_ops::fsync,
+    .opendir = fuse_ops::opendir,
+    .readdir = fuse_ops::readdir,
+    .create = fuse_ops::create,
 };
 
 DEFINE_bool(f, false, "foreground");
