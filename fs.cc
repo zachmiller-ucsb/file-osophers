@@ -106,6 +106,7 @@ void Fileosophy::MakeRootDirectory(uid_t uid, gid_t gid) {
 
 CachedINode* Fileosophy::GetINode(int64_t inode) {
   if (auto search = opened_files_.find(inode); search != opened_files_.end()) {
+    search->second.block_.MoveToHead();
     return &search->second;
   }
 
@@ -292,6 +293,8 @@ Fileosophy::GetBlockGroupDescriptor(int descriptor_num) {
   auto block_group_table =
       block_group_table_blk
           .data_as<BlockGroupDescriptor[kBlockGroupDescriptorsPerTable]>();
+
+  block_group_table_blk.MoveToHead();
 
   return {
       block_group_table_blk,
@@ -607,6 +610,8 @@ void CachedINode::read(std::span<uint8_t> out, int64_t offset) {
   const auto size = std::ssize(out);
   CHECK_LT(size + offset, data_->size);
 
+  block_.MoveToHead();
+
   read_write_helper(size, offset,
                     [this, out](int64_t block_i, int64_t bytes_read,
                                 int64_t local_size, int64_t start) {
@@ -620,6 +625,8 @@ void CachedINode::read(std::span<uint8_t> out, int64_t offset) {
 void CachedINode::read_iovec(int64_t size, int64_t offset,
                              std::function<void(std::span<iovec>)> outs) {
   CHECK_LE(size + offset, data_->size);
+
+  block_.MoveToHead();
 
   std::vector<iovec> out;
   std::vector<PinnedBlock> pinned_blocks;
@@ -836,6 +843,10 @@ void CachedINode::ReadDir(
 
   const auto off_local = off % kBlockSize;
 
+  // LOG(INFO) << "Start reading from " << blknum << " " << off_local;
+
+  block_.MoveToHead();
+
   while (blknum < nblocks) {
     auto blki = get_block(blknum);
     auto blk = fs->blocks_->LockBlock(blki);
@@ -846,9 +857,14 @@ void CachedINode::ReadDir(
     do {
       const DirectoryEntry* de =
           reinterpret_cast<const DirectoryEntry*>(blkdata);
-      blkdata += de->alloc_length;
 
-      if (blkdata - start < off_local) {
+      const auto de_off = blkdata - start;
+      blkdata += de->alloc_length;
+      const auto next_off = (blknum * kBlockSize) + (blkdata - start);
+
+      // LOG(INFO) << de->name_str() << " " << next_off << " " << de_off << " "
+      //           << off_local;
+      if (de_off < off_local) {
         // Skip blocks whose offset is less than our starting offset
         continue;
       }
@@ -858,7 +874,6 @@ void CachedINode::ReadDir(
         continue;
       }
 
-      const auto next_off = (blknum * kBlockSize) + (blkdata - start);
       if (!callback(de, next_off)) {
         break;
       }

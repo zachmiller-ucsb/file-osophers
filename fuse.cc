@@ -17,6 +17,7 @@ void create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
   if (fs->super_->unallocated_inodes_count < 1 ||
       fs->super_->unallocated_blocks_count < 2) {
     CHECK_EQ(fuse_reply_err(req, ENOSPC), 0);
+    return;
   }
 
   LOG(INFO) << "create(" << parent << ", \"" << name << "\", " << std::hex
@@ -143,8 +144,8 @@ void getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /* fi */) {
   struct stat s;
   inode->FillStat(&s);
 
-  LOG(INFO) << "getattr " << ino << " " << std::hex << s.st_mode << ' '
-            << s.st_uid;
+  // LOG(INFO) << "getattr " << ino << " " << std::hex << s.st_mode << ' '
+  //           << s.st_uid;
 
   CHECK_EQ(fuse_reply_attr(req, &s, 0.0), 0);
 }
@@ -172,10 +173,14 @@ void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
 void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
 
+  LOG(INFO) << "mkdir(" << parent << ", \"" << name << "\", " << std::hex
+            << mode << ")";
+
   if (fs->super_->unallocated_inodes_count < 1 ||
       fs->super_->unallocated_blocks_count < 2) {
     // Need blocks for directory entries, even if we have a free inode
     CHECK_EQ(fuse_reply_err(req, ENOSPC), 0);
+    return;
   }
 
   int16_t flags;
@@ -198,6 +203,7 @@ void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
   if (inode) {
     // Already exists
     CHECK_EQ(fuse_reply_err(req, EEXIST), 0);
+    return;
   }
 
   auto ctx = fuse_req_ctx(req);
@@ -296,6 +302,7 @@ void setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     // This can fail, so try it first
     if (!fs->TruncateINode(inode, attr->st_size)) {
       CHECK_EQ(fuse_reply_err(req, ENOSPC), 0);
+      return;
     }
   }
   if (to_set & FUSE_SET_ATTR_MODE) {
@@ -337,7 +344,7 @@ void unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
   auto p = fs->GetINode(parent);
 
-  LOG(INFO) << "unlink(" << parent << ", " << name << ")";
+  LOG(INFO) << "unlink(" << parent << ", \"" << name << "\")";
 
   if (p->data_->mode != Type::kDirectory) {
     CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
@@ -466,6 +473,9 @@ void readdir(fuse_req_t req, fuse_ino_t ino, const size_t size, const off_t off,
 void rename(fuse_req_t req, fuse_ino_t parent, const char* name,
             fuse_ino_t newparent,
             const char* newname /*, unsigned int flags */) {
+  LOG(INFO) << "rename(" << parent << ", \"" << name << "\", " << newparent
+            << ", \"" << newname << "\")";
+
   unsigned int flags = 0;
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
 
@@ -580,7 +590,7 @@ int main(int argc, char** argv) {
 
   struct fuse_args args = FUSE_ARGS_INIT(argc - 2, argv + 2);
 
-  BlockCache cache(disk, 32);
+  BlockCache cache(disk, 64);
   Fileosophy fs(&cache);
 
   if (FLAGS_mkfs) {
