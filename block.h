@@ -30,6 +30,7 @@ class Block {
   int64_t id() const { return id_; }
   int32_t ref_count() const { return ref_count_; }
   Block* lru_next() { return lru_next_; }
+  Block* lru_prev() { return lru_prev_; }
 
  private:
   int64_t id_;
@@ -80,9 +81,9 @@ class PinnedBlock {
 
 class BlockCache {
  public:
-  explicit BlockCache(const char* path, int cache_size);
+  explicit BlockCache(const char* path, size_t cache_size);
 
-  explicit BlockCache(int fd, int cache_size);
+  explicit BlockCache(int fd, size_t cache_size);
 
   ~BlockCache();
 
@@ -121,6 +122,7 @@ class BlockCache {
   BlockCache(BlockCache&&) = delete;
 
   Block* LoadBlockToCache(int64_t block);
+  void MoveToHead(Block* block);
 
   void Drop(int64_t block);
 
@@ -128,8 +130,9 @@ class BlockCache {
 
   int fd_ = -1;
   int64_t block_count_;
-  int cache_size_;
+  size_t cache_size_;
   Block* lru_head_ = nullptr;
+  Block* lru_tail_ = nullptr;
   std::unordered_map<int64_t, Block> blocks_;
 };
 

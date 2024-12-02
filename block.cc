@@ -1,5 +1,6 @@
 #include "block.h"
 
+#include <iostream>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -66,7 +67,7 @@ void PinnedBlock::release() {
   }
 }
 
-BlockCache::BlockCache(const char* path, int cache_size)
+BlockCache::BlockCache(const char* path, size_t cache_size)
     : BlockCache(open(path, O_RDWR
 #if __linux__
                                 | O_DIRECT
@@ -75,11 +76,11 @@ BlockCache::BlockCache(const char* path, int cache_size)
                  cache_size) {
 }
 
-BlockCache::BlockCache(int fd, int cache_size)
+BlockCache::BlockCache(int fd, size_t cache_size)
     : fd_(fd), cache_size_(cache_size) {
   PCHECK(fd_ > 0);
   const int64_t size = lseek(fd_, 0, SEEK_END);
-  PCHECK(size > 0);
+  PCHECK(size > 1);
   block_count_ = size / kBlockSize;
 
   LOG(INFO) << "Opened fs with " << block_count_ << " blocks";
@@ -98,10 +99,14 @@ BlockCache::~BlockCache() {
 
   CHECK(blocks_.empty());
   CHECK(lru_head_ == nullptr);
+  CHECK(lru_tail_ == nullptr);
 }
 
 PinnedBlock BlockCache::LockBlock(int64_t block) {
   auto loaded_block = LoadBlockToCache(block);
+
+  MoveToHead(loaded_block);
+
   return PinnedBlock(loaded_block);
 }
 
@@ -120,8 +125,7 @@ void BlockCache::CopyBlock(int64_t block, std::span<uint8_t> dest,
 
   memcpy(dest.data(), &loaded_block->data()[offset], dest.size());
 
-  loaded_block->RelinkInFrontOf(lru_head_);
-  lru_head_ = loaded_block;
+  MoveToHead(loaded_block);
 
   // PrintLRU(LOG(INFO));
 }
@@ -134,13 +138,30 @@ void BlockCache::WriteBlock(int64_t block, std::span<const uint8_t> src,
   memcpy(&loaded_block->data_mutable()[offset], src.data(), src.size());
   loaded_block->set_modified();
 
-  loaded_block->RelinkInFrontOf(lru_head_);
-  lru_head_ = loaded_block;
+  MoveToHead(loaded_block);
 
   // PrintLRU(LOG(INFO));
 }
 
 Block* BlockCache::LoadBlockToCache(int64_t block) {
+  // Check if block cache is full,
+  // lru_tail_ should not be pinned
+  if (blocks_.size() == cache_size_) {
+    CHECK(lru_tail_ != nullptr);
+
+    // We require cache_size_ > 1, so that
+    // super block doesn't screw with LRU
+    if (lru_tail_->ref_count() > 0) {
+      MoveToHead(lru_tail_);
+    }
+    if (lru_tail_->ref_count() != 0) {
+      PrintLRU(std::cout);
+    }
+
+    CHECK(lru_tail_->ref_count() == 0);
+    Drop(lru_tail_->id());
+  }
+
   auto [blk, res] = blocks_.try_emplace(block, block, lru_head_);
   if (!res) {
     // Already loaded in cache, no need to re-read.
@@ -159,8 +180,22 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
       << " at " << off << ", got " << bytes_read;
 
   lru_head_ = &blk->second;
+  if (lru_tail_ == nullptr)
+    lru_tail_ = &blk->second;
 
   return &blk->second;
+}
+
+void BlockCache::MoveToHead(Block* block) {
+  if (block == lru_head_)
+    return;
+  
+  if (block == lru_tail_) {
+    lru_tail_ = block->lru_prev();
+  }
+
+  block->RelinkInFrontOf(lru_head_);
+  lru_head_ = block;
 }
 
 void BlockCache::Drop(int64_t block) {
@@ -172,6 +207,9 @@ void BlockCache::Drop(int64_t block) {
 
   if (blk == lru_head_) {
     lru_head_ = blk->lru_next();
+  }
+  if (blk == lru_tail_) {
+    lru_tail_ = blk->lru_prev();
   }
 
   blk->Unlink();

@@ -580,7 +580,7 @@ int main(int argc, char** argv) {
 
   struct fuse_args args = FUSE_ARGS_INIT(argc - 2, argv + 2);
 
-  BlockCache cache(disk, 8);
+  BlockCache cache(disk, 32);
   Fileosophy fs(&cache);
 
   if (FLAGS_mkfs) {
