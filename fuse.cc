@@ -281,10 +281,6 @@ void read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
   LOG(INFO) << "read(" << ino << ", " << size << ", " << off << ")";
   inode->read_iovec(size, off, [req](std::span<iovec> vec) {
-    LOG(INFO) << "Vec " << vec.size();
-    for (auto& v : vec) {
-      LOG(INFO) << v.iov_base << ' ' << v.iov_len;
-    }
     CHECK_EQ(fuse_reply_iov(req, vec.data(), vec.size()), 0);
   });
 }

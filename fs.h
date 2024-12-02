@@ -239,6 +239,8 @@ struct CachedINode {
   const int64_t block_group_;
   int32_t lookups_ = 0;
 
+  void set_modified() { block_.set_modified(); }
+
   int64_t num_blocks() const {
     return divide_round_up<int64_t>(data_->size, kBlockSize);
   }

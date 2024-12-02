@@ -18,6 +18,7 @@ Block::~Block() {
   // Should already be unlinked
   CHECK_EQ(lru_next_, nullptr);
   CHECK_EQ(lru_prev_, nullptr);
+  CHECK_EQ(ref_count_, 0);
 }
 
 void Block::Unlink() {

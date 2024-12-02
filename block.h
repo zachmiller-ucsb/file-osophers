@@ -53,7 +53,7 @@ class PinnedBlock {
     reset(p.block_);
     return *this;
   }
-  PinnedBlock(PinnedBlock&&) = default;
+  PinnedBlock(PinnedBlock&& p) : block_(p.block_) { p.block_ = nullptr; }
 
   ~PinnedBlock() { release(); }
 
