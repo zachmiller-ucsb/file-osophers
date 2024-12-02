@@ -8,9 +8,11 @@
 
 constexpr int kBlockSize = 4096;
 
+class BlockCache;
+
 class Block {
  public:
-  explicit Block(int64_t id, Block* next);
+  explicit Block(int64_t id, Block* next, BlockCache* cache);
   Block(const Block&) = delete;
   Block& operator=(const Block&) = delete;
 
@@ -24,7 +26,7 @@ class Block {
   std::span<uint8_t, kBlockSize> data_mutable() { return data_; }
 
   bool modified() const { return modified_; }
-  void set_modified() { modified_ = true; }
+  void set_modified();
   void clear_modified() { modified_ = false; }
 
   int64_t id() const { return id_; }
@@ -37,6 +39,7 @@ class Block {
   int32_t ref_count_ = 0;
   Block* lru_prev_ = nullptr;
   Block* lru_next_ = nullptr;
+  BlockCache* cache_;
   bool modified_ = false;
   alignas(kBlockSize) std::array<uint8_t, kBlockSize> data_;
 
@@ -70,7 +73,10 @@ class PinnedBlock {
     return reinterpret_cast<T*>(data.data());
   }
 
+  void MoveToHead();
   void set_modified() { block_->set_modified(); }
+
+  int64_t id() const { return block_->id(); }
 
  private:
   void reset(Block* block);
@@ -116,13 +122,14 @@ class BlockCache {
                offset * sizeof(int64_t));
   }
 
+  void MoveToHead(Block* block);
+
  private:
   BlockCache(const BlockCache&) = delete;
   BlockCache& operator=(const BlockCache&) = delete;
   BlockCache(BlockCache&&) = delete;
 
   Block* LoadBlockToCache(int64_t block);
-  void MoveToHead(Block* block);
 
   void Drop(int64_t block);
 

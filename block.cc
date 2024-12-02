@@ -1,13 +1,15 @@
 #include "block.h"
 
-#include <iostream>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <iostream>
+
 #include "glog/logging.h"
 
-Block::Block(int64_t id, Block* next) : id_(id), lru_next_(next) {
+Block::Block(int64_t id, Block* next, BlockCache* cache)
+    : id_(id), lru_next_(next), cache_(CHECK_NOTNULL(cache)) {
   if (lru_next_) {
     CHECK_EQ(lru_next_->lru_prev_, nullptr)
         << "May only insert at head of list";
@@ -50,6 +52,11 @@ void Block::RelinkInFrontOf(Block* next) {
   }
 }
 
+void Block::set_modified() {
+  modified_ = true;
+  cache_->MoveToHead(this);
+}
+
 PinnedBlock::PinnedBlock(Block* block) : block_(block) { ++block_->ref_count_; }
 
 void PinnedBlock::reset(Block* block) {
@@ -66,6 +73,8 @@ void PinnedBlock::release() {
     block_ = nullptr;
   }
 }
+
+void PinnedBlock::MoveToHead() { block_->cache_->MoveToHead(block_); }
 
 BlockCache::BlockCache(const char* path, size_t cache_size)
     : BlockCache(open(path, O_RDWR
@@ -149,20 +158,25 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
   if (blocks_.size() == cache_size_) {
     CHECK(lru_tail_ != nullptr);
 
-    // We require cache_size_ > 1, so that
-    // super block doesn't screw with LRU
-    if (lru_tail_->ref_count() > 0) {
-      MoveToHead(lru_tail_);
-    }
-    if (lru_tail_->ref_count() != 0) {
-      PrintLRU(std::cout);
+    // Remove a block
+    Block* blk_iter = lru_tail_;
+    while (blk_iter != nullptr) {
+      if (blk_iter->ref_count() == 0) {
+        Drop(blk_iter->id());
+        break;
+      } else {
+        blk_iter = blk_iter->lru_prev();
+      }
     }
 
-    CHECK(lru_tail_->ref_count() == 0);
-    Drop(lru_tail_->id());
+    // No blocks to remove
+    if (blocks_.size() == cache_size_) {
+      PrintLRU(LOG(INFO));
+      LOG(FATAL) << "Failed to drop any blocks";
+    }
   }
 
-  auto [blk, res] = blocks_.try_emplace(block, block, lru_head_);
+  auto [blk, res] = blocks_.try_emplace(block, block, lru_head_, this);
   if (!res) {
     // Already loaded in cache, no need to re-read.
     return &blk->second;
@@ -180,16 +194,16 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
       << " at " << off << ", got " << bytes_read;
 
   lru_head_ = &blk->second;
-  if (lru_tail_ == nullptr)
+  if (lru_tail_ == nullptr) {
     lru_tail_ = &blk->second;
+  }
 
   return &blk->second;
 }
 
 void BlockCache::MoveToHead(Block* block) {
-  if (block == lru_head_)
-    return;
-  
+  if (block == lru_head_) return;
+
   if (block == lru_tail_) {
     lru_tail_ = block->lru_prev();
   }
@@ -230,6 +244,7 @@ void BlockCache::PrintLRU(std::ostream& os) const {
       os << " -> ";
     }
     os << blk->id();
+    os << " (" << blk->ref_count() << ")";
     first = false;
     blk = blk->lru_next();
   }
