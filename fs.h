@@ -223,26 +223,38 @@ class Fileosophy;
 struct CachedINode {
   CachedINode(int64_t inode, INode* data, PinnedBlock block, Fileosophy* fs)
       : inode_(inode),
-        data_(data),
+        data__(data),
         block_(block),
         fs(fs),
-        block_group_(GroupOfInode(inode)) {}
+        block_group_(GroupOfInode(inode)),
+        inode_table_(block.id()) {}
 
   ~CachedINode();
 
   CachedINode(CachedINode&&) = delete;
 
   int64_t inode_;
-  INode* data_;
+  INode* data__;
   PinnedBlock block_;
   Fileosophy* fs = nullptr;
   const int64_t block_group_;
+  const int64_t inode_table_;
   int32_t lookups_ = 0;
+  int32_t opens_ = 0;
+
+  const INode* data() const { return data__; }
+  INode* datam() {
+    set_modified();
+    return data__;
+  }
+
+  void OpenData();
+  void CloseData();
 
   void set_modified() { block_.set_modified(); }
 
   int64_t num_blocks() const {
-    return divide_round_up<int64_t>(data_->size, kBlockSize);
+    return divide_round_up<int64_t>(data()->size, kBlockSize);
   }
 
   int64_t get_block(int64_t block_index);
@@ -273,7 +285,7 @@ struct CachedINode {
   // Does NOT update link count of inode
   std::optional<int64_t> RemoveDE(std::string_view filename);
 
-  CachedINode* LookupFile(std::string_view filename);
+  std::optional<int64_t> LookupFile(std::string_view filename);
 
   // Reads entries until callback returns false. To resume, invoke with off
   // returned by previous call.
@@ -283,10 +295,30 @@ struct CachedINode {
   bool IsEmpty();
 
   void FillStat(struct stat* attr);
+
+ private:
+  std::optional<int32_t> old_link_count_;
 };
 
 struct CachedDirectory {
   CachedDirectory(CachedINode* inode);
+
+  Fileosophy* fs_;
+  CachedINode* inode_;
+};
+
+struct RAIIInode {
+  RAIIInode(Fileosophy* fs, CachedINode* inode) : fs_(fs), inode_(inode) {
+    ++inode_->opens_;
+  }
+  ~RAIIInode();
+
+  RAIIInode(const RAIIInode&) = delete;
+  RAIIInode& operator=(const RAIIInode&) = delete;
+
+  CachedINode* operator->() { return inode_; }
+
+  operator CachedINode*() { return inode_; }
 
   Fileosophy* fs_;
   CachedINode* inode_;
@@ -303,11 +335,17 @@ class Fileosophy {
   std::pair<PinnedBlock, BlockGroupDescriptor*> GetBlockGroupDescriptor(
       int descriptor_num);
 
+  std::pair<PinnedBlock, INode*> GetINodeData(
+      int64_t inode, std::optional<int64_t> inode_table_i = {});
+
   CachedINode* GetINode(int64_t inode);
+
+  RAIIInode GetTmpINode(int64_t inode);
 
   CachedINode* NewINode(int32_t hint);
 
   void ForgetInode(int64_t inode, uint64_t nlookup);
+  void CloseInode(int64_t inode);
 
   void InitINode(INode* inode, Type mode, int16_t flags, int32_t uid,
                  int32_t gid);

@@ -37,12 +37,14 @@ void create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
   }
 
   auto parent_dir = fs->GetINode(parent);
-  auto inode = parent_dir->LookupFile(name);
 
-  if (!inode) {
+  CachedINode* inode;
+  if (auto ino = parent_dir->LookupFile(name)) {
+    inode = fs->GetINode(*ino);
+  } else {
     // Create file if it doesn't exist
     auto new_inode = fs->NewINode(parent_dir->block_group_);
-    fs->InitINode(new_inode->data_, type, flags, ctx->uid, ctx->gid);
+    fs->InitINode(new_inode->datam(), type, flags, ctx->uid, ctx->gid);
 
     CHECK(parent_dir->AddDirectoryEntry(name, new_inode->inode_, type));
     inode = new_inode;
@@ -54,6 +56,7 @@ void create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
   inode->FillStat(&e.attr);
 
   ++inode->lookups_;
+  ++inode->opens_;
 
   fi->fh = reinterpret_cast<uintptr_t>(inode);
 
@@ -89,7 +92,7 @@ void fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
 
   auto inode = fs->GetINode(ino);
 
-  if (offset + length <= inode->data_->size) {
+  if (offset + length <= inode->data()->size) {
     // Smaller or same, no change
     CHECK_EQ(fuse_reply_err(req, 0), 0);
     return;
@@ -139,7 +142,7 @@ void getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /* fi */) {
   // fi is always NULL
   auto fs =
       CHECK_NOTNULL(reinterpret_cast<Fileosophy*>(fuse_req_userdata(req)));
-  auto inode = fs->GetINode(ino);
+  auto inode = fs->GetTmpINode(ino);
 
   struct stat s;
   inode->FillStat(&s);
@@ -150,19 +153,58 @@ void getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /* fi */) {
   CHECK_EQ(fuse_reply_attr(req, &s, 0.0), 0);
 }
 
-void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
-  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
-  auto parent_dir = fs->GetINode(parent);
-  auto inode = parent_dir->LookupFile(name);
+void link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
+          const char* newname) {
+  auto fs =
+      CHECK_NOTNULL(reinterpret_cast<Fileosophy*>(fuse_req_userdata(req)));
+  auto inode = fs->GetINode(ino);
+  auto new_parent = fs->GetINode(newparent);
 
-  if (!inode) {
-    CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
+  if (inode->data()->mode != Type::kRegular) {
+    // Can only link regular files
+    CHECK_EQ(fuse_reply_err(req, EPERM), 0);
     return;
   }
+
+  if (new_parent->data()->mode != Type::kDirectory) {
+    // Parent must be a directory
+    CHECK_EQ(fuse_reply_err(req, ENOTDIR), 0);
+    return;
+  }
+
+  if (new_parent->LookupFile(newname).has_value()) {
+    // Link already exists
+    CHECK_EQ(fuse_reply_err(req, EEXIST), 0);
+    return;
+  }
+
+  CHECK(new_parent->AddDirectoryEntry(newname, ino, inode->data()->mode));
+  ++inode->datam()->link_count;
 
   struct fuse_entry_param e{.ino = static_cast<fuse_ino_t>(inode->inode_),
                             .generation = 1,
                             .attr_timeout = 0};
+  inode->FillStat(&e.attr);
+
+  ++inode->lookups_;
+
+  CHECK_EQ(fuse_reply_entry(req, &e), 0);
+}
+
+void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+  auto parent_dir = fs->GetTmpINode(parent);
+  auto ino = parent_dir->LookupFile(name);
+
+  if (!ino) {
+    CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
+    return;
+  }
+
+  auto inode = fs->GetTmpINode(*ino);
+
+  struct fuse_entry_param e{
+      .ino = static_cast<fuse_ino_t>(*ino), .generation = 1, .attr_timeout = 0};
   inode->FillStat(&e.attr);
 
   ++inode->lookups_;
@@ -199,27 +241,29 @@ void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
 
   auto parent_dir = fs->GetINode(parent);
   CHECK_EQ(static_cast<fuse_ino_t>(parent_dir->inode_), parent);
-  auto inode = parent_dir->LookupFile(name);
-  if (inode) {
+  auto ino = parent_dir->LookupFile(name);
+  if (ino) {
     // Already exists
     CHECK_EQ(fuse_reply_err(req, EEXIST), 0);
     return;
   }
 
   auto ctx = fuse_req_ctx(req);
+  auto inode = fs->GetINode(*ino);
 
   inode = fs->NewINode(parent_dir->block_group_);
-  fs->InitINode(inode->data_, type, flags, ctx->uid, ctx->gid);
+  auto datam = inode->datam();
+  fs->InitINode(datam, type, flags, ctx->uid, ctx->gid);
 
   // Two links - the link from parent, and the "." file
-  inode->data_->link_count = 2;
+  datam->link_count = 2;
 
   CHECK(parent_dir->AddDirectoryEntry(name, inode->inode_, type));
   CHECK(inode->AddDirectoryEntry(".", inode->inode_, type));
 
   // Link back to parent
   CHECK(inode->AddDirectoryEntry("..", parent, type));
-  ++parent_dir->data_->link_count;
+  ++parent_dir->datam()->link_count;
 
   struct fuse_entry_param e{.ino = static_cast<fuse_ino_t>(inode->inode_),
                             .generation = 1,
@@ -237,27 +281,31 @@ void open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
   LOG(INFO) << "open(" << ino << ", " << std::hex << fi->flags << ")";
 
   auto inode = fs->GetINode(ino);
-  if (inode->data_->mode == Type::kDirectory) {
+  if (inode->data()->mode == Type::kDirectory) {
     CHECK_EQ(fuse_reply_err(req, ENOSYS), 0);
     return;
   } else {
-    CHECK(inode->data_->mode == Type::kRegular);
+    CHECK(inode->data()->mode == Type::kRegular);
   }
 
   fi->fh = reinterpret_cast<uintptr_t>(inode);
+  ++inode->opens_;
 
   CHECK_EQ(fuse_reply_open(req, fi), 0);
 }
 
 void opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+  LOG(INFO) << "opendir(" << ino << ", " << std::hex << fi->flags << ")";
+
   auto inode = fs->GetINode(ino);
-  if (inode->data_->mode != Type::kDirectory) {
+  if (inode->data()->mode != Type::kDirectory) {
     CHECK_EQ(fuse_reply_err(req, ENOTDIR), 0);
     return;
   }
 
   fi->fh = reinterpret_cast<uintptr_t>(inode);
+  ++inode->opens_;
 
   CHECK_EQ(fuse_reply_open(req, fi), 0);
 }
@@ -275,7 +323,7 @@ void read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
   CHECK_LE(static_cast<int64_t>(size), kMaxReadSize)
       << "Read size larger than expected from fuse";
 
-  const int64_t fsize = inode->data_->size;
+  const int64_t fsize = inode->data()->size;
   if (off > fsize) {
     // Out of range, EOF (can't read any bytes)
     CHECK_EQ(fuse_reply_err(req, 0), 0);
@@ -285,7 +333,7 @@ void read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
   // Can read at most requested bytes, or remaining bytes starting at off
   size = std::min<int64_t>(size, fsize - off);
 
-  LOG(INFO) << "read(" << ino << ", " << size << ", " << off << ")";
+  // LOG(INFO) << "read(" << ino << ", " << size << ", " << off << ")";
   inode->read_iovec(size, off, [req](std::span<iovec> vec) {
     CHECK_EQ(fuse_reply_iov(req, vec.data(), vec.size()), 0);
   });
@@ -296,7 +344,8 @@ void setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
   auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
   auto inode = fs->GetINode(ino);
 
-  inode->data_->flags &= ~(flags::kSetUid | flags::kSetGid);
+  auto datam = inode->datam();
+  datam->flags &= ~(flags::kSetUid | flags::kSetGid);
 
   if (to_set & FUSE_SET_ATTR_SIZE) {
     // This can fail, so try it first
@@ -309,28 +358,28 @@ void setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     Type type;
     int16_t flags;
     ModeToFlags(attr->st_mode, &type, &flags);
-    CHECK(type == inode->data_->mode);
-    inode->data_->flags = flags;
+    CHECK(type == datam->mode);
+    datam->flags = flags;
   }
   if (to_set & FUSE_SET_ATTR_UID) {
-    inode->data_->uid = attr->st_uid;
+    datam->uid = attr->st_uid;
   }
   if (to_set & FUSE_SET_ATTR_GID) {
-    inode->data_->gid = attr->st_gid;
+    datam->gid = attr->st_gid;
   }
   if (to_set & FUSE_SET_ATTR_ATIME) {
-    inode->data_->atime = attr->st_atime;
+    datam->atime = attr->st_atime;
   }
   if (to_set & FUSE_SET_ATTR_MTIME) {
-    inode->data_->mtime = attr->st_mtime;
+    datam->mtime = attr->st_mtime;
   }
   if (to_set & (FUSE_SET_ATTR_ATIME_NOW | FUSE_SET_ATTR_MTIME_NOW)) {
     auto t = time(nullptr);
     if (to_set & FUSE_SET_ATTR_ATIME_NOW) {
-      inode->data_->atime = t;
+      datam->atime = t;
     }
     if (to_set & FUSE_SET_ATTR_MTIME_NOW) {
-      inode->data_->mtime = t;
+      datam->mtime = t;
     }
   }
 
@@ -346,7 +395,7 @@ void unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
 
   LOG(INFO) << "unlink(" << parent << ", \"" << name << "\")";
 
-  if (p->data_->mode != Type::kDirectory) {
+  if (p->data()->mode != Type::kDirectory) {
     CHECK_EQ(fuse_reply_err(req, EINVAL), 0);
     return;
   }
@@ -359,25 +408,26 @@ void unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
 
   auto inode = fs->GetINode(*ino);
   // Sanity check, we should use rmdir otherwise
-  CHECK(inode->data_->mode == Type::kRegular);
+  CHECK(inode->data()->mode == Type::kRegular);
 
-  CHECK_GE(--inode->data_->link_count, 0) << "link_count < 0?";
+  CHECK_GE(--inode->datam()->link_count, 0) << "link_count < 0?";
   CHECK_EQ(fuse_reply_err(req, 0), 0);
 }
 
 // Returns 0 on success, positive error code otherwise
-bool do_rmdir(CachedINode* p, const char* name) {
-  if (p->data_->mode != Type::kDirectory) {
+bool do_rmdir(Fileosophy* fs, CachedINode* p, const char* name) {
+  if (p->data()->mode != Type::kDirectory) {
     return EINVAL;
   }
 
-  auto inode = p->LookupFile(name);
-  if (inode == nullptr) {
+  auto ino = p->LookupFile(name);
+  if (!ino) {
     return ENOENT;
   }
+  auto inode = fs->GetTmpINode(*ino);
 
   // Sanity check, we should use unlink otherwise
-  CHECK(inode->data_->mode == Type::kDirectory);
+  CHECK(inode->data()->mode == Type::kDirectory);
 
   // Check that directory is empty
   if (!inode->IsEmpty()) {
@@ -387,11 +437,11 @@ bool do_rmdir(CachedINode* p, const char* name) {
   CHECK(p->RemoveDE(name).has_value());
 
   // Remove link to parent
-  CHECK_GE(--p->data_->link_count, 2);
+  CHECK_GE(--p->datam()->link_count, 2);
 
   // Should be exactly 2 links at this point, since directory is empty
-  CHECK_EQ(inode->data_->link_count, 2);
-  inode->data_->link_count = 0;
+  CHECK_EQ(inode->data()->link_count, 2);
+  inode->datam()->link_count = 0;
 
   return 0;
 }
@@ -405,7 +455,7 @@ void rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
   }
 
   auto p = fs->GetINode(parent);
-  if (int err = do_rmdir(p, name)) {
+  if (int err = do_rmdir(fs, p, name)) {
     CHECK_EQ(fuse_reply_err(req, err), 0);
     return;
   }
@@ -421,13 +471,13 @@ void write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
   CHECK_EQ(static_cast<fuse_ino_t>(inode->inode_), ino);
 
   // Reset setuid on write
-  inode->data_->flags &= ~(flags::kSetUid | flags::kSetGid);
+  inode->datam()->flags &= ~(flags::kSetUid | flags::kSetGid);
 
-  const int64_t old_size = inode->data_->size;
+  const int64_t old_size = inode->data()->size;
   const int64_t new_size = std::max<int64_t>(old_size, off + size);
 
   if (old_size != new_size && !fs->GrowINode(inode, new_size)) {
-    LOG(INFO) << "write new_size " << ino << " " << new_size;
+    // LOG(INFO) << "write new_size " << ino << " " << new_size;
     CHECK_EQ(fuse_reply_err(req, ENOSPC), 0);
     return;
   }
@@ -470,6 +520,21 @@ void readdir(fuse_req_t req, fuse_ino_t ino, const size_t size, const off_t off,
   CHECK_EQ(fuse_reply_buf(req, fuse_direntries.data(), bytes_added), 0);
 }
 
+void release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /* fi */) {
+  LOG(INFO) << "release(" << ino << ")";
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+  fs->CloseInode(ino);
+  CHECK_EQ(fuse_reply_err(req, 0), 0);
+}
+
+void releasedir(fuse_req_t req, fuse_ino_t ino,
+                struct fuse_file_info* /* fi */) {
+  LOG(INFO) << "releasedir(" << ino << ")";
+  auto fs = reinterpret_cast<Fileosophy*>(fuse_req_userdata(req));
+  fs->CloseInode(ino);
+  CHECK_EQ(fuse_reply_err(req, 0), 0);
+}
+
 void rename(fuse_req_t req, fuse_ino_t parent, const char* name,
             fuse_ino_t newparent,
             const char* newname /*, unsigned int flags */) {
@@ -490,37 +555,38 @@ void rename(fuse_req_t req, fuse_ino_t parent, const char* name,
   CHECK_EQ(static_cast<fuse_ino_t>(parent_dir->inode_), parent);
   CHECK_EQ(static_cast<fuse_ino_t>(new_parent->inode_), newparent);
 
-  auto target_inode = new_parent->LookupFile(newname);
-  if ((flags & RENAME_NOREPLACE) && target_inode) {
+  auto target_ino = new_parent->LookupFile(newname);
+  if ((flags & RENAME_NOREPLACE) && target_ino) {
     // Don't overwrite target if it exists
     CHECK_EQ(fuse_reply_err(req, EEXIST), 0);
     return;
   }
 
-  if ((flags & RENAME_EXCHANGE) && !target_inode) {
+  if ((flags & RENAME_EXCHANGE) && !target_ino) {
     // Exchange requires that target exists
     CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
     return;
   }
 
-  auto inode = parent_dir->LookupFile(name);
-  if (!inode) {
+  auto ino = parent_dir->LookupFile(name);
+  if (!ino) {
     // Doesn't exist
     CHECK_EQ(fuse_reply_err(req, ENOENT), 0);
     return;
   }
 
-  if (target_inode) {
+  if (target_ino) {
+    auto target_inode = fs->GetTmpINode(*target_ino);
     // Unlink target
-    if (target_inode->data_->mode == Type::kDirectory) {
-      const int err = do_rmdir(new_parent, newname);
+    if (target_inode->data()->mode == Type::kDirectory) {
+      const int err = do_rmdir(fs, new_parent, newname);
       if (err) {
         CHECK_EQ(fuse_reply_err(req, err), 0);
         return;
       }
-    } else if (target_inode->data_->mode == Type::kRegular) {
+    } else if (target_inode->data()->mode == Type::kRegular) {
       CHECK(new_parent->RemoveDE(newname).has_value());
-      CHECK_GE(--target_inode->data_->link_count, 0) << "link_count < 0?";
+      CHECK_GE(--target_inode->datam()->link_count, 0) << "link_count < 0?";
     } else {
       LOG(FATAL) << "???";
     }
@@ -529,19 +595,21 @@ void rename(fuse_req_t req, fuse_ino_t parent, const char* name,
   // Remove entry from current directory
   CHECK(parent_dir->RemoveDE(name).has_value());
 
+  auto inode = fs->GetTmpINode(*ino);
+
   // Add entry to new directory
   CHECK(new_parent->AddDirectoryEntry(newname, inode->inode_,
-                                      inode->data_->mode));
+                                      inode->data()->mode));
 
-  if (parent != newparent && inode->data_->mode == Type::kDirectory) {
+  if (parent != newparent && inode->data()->mode == Type::kDirectory) {
     // If this is a directory and moving under a new parent, update ".."
 
     // Remove link to old parent
-    CHECK_GE(--parent_dir->data_->link_count, 2);
+    CHECK_GE(--parent_dir->datam()->link_count, 2);
     CHECK(inode->RemoveDE("..").has_value());
 
     // Add link to new parent
-    ++new_parent->data_->link_count;
+    ++new_parent->datam()->link_count;
     CHECK(inode->AddDirectoryEntry("..", newparent, Type::kDirectory));
   }
 
@@ -564,14 +632,16 @@ static const struct fuse_lowlevel_ops fileosophy_ops{
     .rmdir = fuse_ops::rmdir,
     .symlink = nullptr,
     .rename = fuse_ops::rename,
-    .link = nullptr,
+    .link = fuse_ops::link,
     .open = fuse_ops::open,
     .read = fuse_ops::read,
     .write = fuse_ops::write,
     .flush = fuse_ops::flush,
+    .release = fuse_ops::release,
     .fsync = fuse_ops::fsync,
     .opendir = fuse_ops::opendir,
     .readdir = fuse_ops::readdir,
+    .releasedir = fuse_ops::releasedir,
     .create = fuse_ops::create,
 };
 
@@ -590,7 +660,7 @@ int main(int argc, char** argv) {
 
   struct fuse_args args = FUSE_ARGS_INIT(argc - 2, argv + 2);
 
-  BlockCache cache(disk, 64);
+  BlockCache cache(disk, 256);
   Fileosophy fs(&cache);
 
   if (FLAGS_mkfs) {

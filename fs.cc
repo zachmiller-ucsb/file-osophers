@@ -16,6 +16,7 @@ constexpr std::array<uint8_t, 4096> kEmptyBlock{};
 Fileosophy::Fileosophy(BlockCache* blocks) : blocks_(blocks) {
   pinned_super_ = blocks_->LockBlock(0);
   super_ = pinned_super_.data_as<Superblock>();
+  pinned_super_.set_modified();
   first_data_block_ =
       1 + kNonDataBlocksPerBlockGroup * super_->num_block_groups;
 }
@@ -97,32 +98,50 @@ void Fileosophy::MakeRootDirectory(uid_t uid, gid_t gid) {
   CHECK_EQ(inode->inode_, kRootInode)
       << "Root should have inode " << kRootInode;
   using namespace flags;
-  InitINode(inode->data_, Type::kDirectory,
+  auto datam = inode->datam();
+  InitINode(datam, Type::kDirectory,
             kUsrR | kUsrW | kUsrX | kGrpR | kGrpX | kOthR | kOthX, uid, gid);
   CHECK(inode->AddDirectoryEntry(".", inode->inode_, Type::kDirectory));
   CHECK(inode->AddDirectoryEntry("..", inode->inode_, Type::kDirectory));
-  inode->data_->link_count = 2;
+  datam->link_count = 2;
+}
+
+RAIIInode Fileosophy::GetTmpINode(int64_t inode) {
+  auto ino = CHECK_NOTNULL(GetINode(inode));
+  return RAIIInode(this, ino);
+}
+
+std::pair<PinnedBlock, INode*> Fileosophy::GetINodeData(
+    int64_t inode, std::optional<int64_t> inode_table_i) {
+  const int64_t local_inode = inode % kINodesPerBlockGroup;
+
+  if (!inode_table_i.has_value()) {
+    const int64_t block_group_num = GroupOfInode(inode);
+    auto [p, block_group] = GetBlockGroupDescriptor(block_group_num);
+
+    inode_table_i =
+        block_group->inode_table + local_inode / kINodesPerTableBlock;
+  }
+
+  auto p2 = blocks_->LockBlock(*inode_table_i);
+  auto inode_table = p2.data_as<INodeTable>();
+
+  // LOG(INFO) << "Inode " << inode << " located in inode table "
+  //           << block_group->inode_table;
+
+  auto* inode_ptr = &inode_table->inodes[local_inode % kINodesPerTableBlock];
+
+  return {p2, inode_ptr};
 }
 
 CachedINode* Fileosophy::GetINode(int64_t inode) {
   if (auto search = opened_files_.find(inode); search != opened_files_.end()) {
+    search->second.OpenData();
     search->second.block_.MoveToHead();
     return &search->second;
   }
 
-  const int64_t block_group_num = GroupOfInode(inode);
-  auto [p, block_group] = GetBlockGroupDescriptor(block_group_num);
-
-  const int64_t local_inode = inode % kINodesPerBlockGroup;
-
-  auto p2 = blocks_->LockBlock(block_group->inode_table +
-                               local_inode / kINodesPerTableBlock);
-  auto inode_table = p2.data_as<INodeTable>();
-
-  LOG(INFO) << "Inode " << inode << " located in inode table "
-            << block_group->inode_table;
-
-  auto* inode_ptr = &inode_table->inodes[local_inode % kINodesPerTableBlock];
+  auto [p2, inode_ptr] = GetINodeData(inode);
 
   return &opened_files_.try_emplace(inode, inode, inode_ptr, p2, this)
               .first->second;
@@ -263,7 +282,21 @@ void Fileosophy::ForgetInode(int64_t inode, uint64_t nlookup) {
       << "More forgets than lookups?";
 
   if (search->second.lookups_ == 0) {
+    CHECK(search->second.opens_ == 0) << "Still open?";
+    LOG(INFO) << "forget lookups==0,opens==0 drop " << inode;
     opened_files_.erase(search);
+  }
+}
+
+void Fileosophy::CloseInode(int64_t inode) {
+  auto search = opened_files_.find(inode);
+  CHECK(search != opened_files_.end());
+  CHECK_GE(search->second.opens_ -= 1, 0) << "More closes than opens?";
+
+  // Once closed we can release the data block;
+  if (search->second.opens_ == 0) {
+    // LOG(INFO) << "Close inode " << inode;
+    search->second.CloseData();
   }
 }
 
@@ -302,7 +335,7 @@ Fileosophy::GetBlockGroupDescriptor(int descriptor_num) {
 }
 
 bool Fileosophy::TruncateINode(CachedINode* inode, int64_t new_size) {
-  const auto old_size = inode->data_->size;
+  const auto old_size = inode->data()->size;
   if (new_size == old_size) {
     return true;
   } else if (new_size > old_size) {
@@ -314,14 +347,14 @@ bool Fileosophy::TruncateINode(CachedINode* inode, int64_t new_size) {
 }
 
 bool Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
-  CHECK_GT(new_size, inode->data_->size);
+  CHECK_GT(new_size, inode->data()->size);
 
   const int64_t num_blocks = inode->num_blocks();
   const int64_t new_num_blocks = divide_round_up<int64_t>(new_size, kBlockSize);
 
   if (num_blocks == new_num_blocks) {
     // Grown, but same number of blocks so no change
-    inode->data_->size = new_size;
+    inode->datam()->size = new_size;
     return true;
   }
 
@@ -341,7 +374,7 @@ bool Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
     hint = *new_blk + 1;
   }
 
-  inode->data_->size = new_size;
+  inode->datam()->size = new_size;
 
   inode->set_modified();
 
@@ -349,7 +382,7 @@ bool Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
 }
 
 void Fileosophy::ShrinkINode(CachedINode* inode, int64_t new_size) {
-  CHECK_LT(new_size, inode->data_->size);
+  CHECK_LT(new_size, inode->data()->size);
   CHECK_GE(new_size, 0);
 
   const int64_t num_blocks = inode->num_blocks();
@@ -375,7 +408,7 @@ void Fileosophy::ShrinkINode(CachedINode* inode, int64_t new_size) {
     }
   }
 
-  inode->data_->size = new_size;
+  inode->datam()->size = new_size;
   inode->set_modified();
 }
 
@@ -399,7 +432,7 @@ void Fileosophy::ReleaseBlock(int64_t block) {
 }
 
 void Fileosophy::DeleteINodeAndBlocks(CachedINode* inode) {
-  CHECK_EQ(inode->data_->link_count, 0);
+  CHECK_EQ(inode->data()->link_count, 0);
   CHECK_EQ(inode->lookups_, 0);
 
   // Restore inode to group
@@ -415,16 +448,17 @@ void Fileosophy::DeleteINodeAndBlocks(CachedINode* inode) {
   bitmap.set_modified();
 
   // Cleanup inode itself
-  inode->data_->mode = Type::kUnknown;
-  inode->data_->size = 0;
+  auto datam = inode->datam();
+  datam->mode = Type::kUnknown;
+  datam->size = 0;
 
-  for (int64_t b : inode->data_->direct_blocks) {
+  for (int64_t b : datam->direct_blocks) {
     if (b) ReleaseBlock(b);
   }
 
-  FreeIndirect(inode->data_->single_indirect, 1);
-  FreeIndirect(inode->data_->double_indirect, 2);
-  FreeIndirect(inode->data_->triple_indirect, 3);
+  FreeIndirect(datam->single_indirect, 1);
+  FreeIndirect(datam->double_indirect, 2);
+  FreeIndirect(datam->triple_indirect, 3);
 
   inode->set_modified();
 }
@@ -502,9 +536,31 @@ std::optional<int64_t> Fileosophy::NewFreeBlock(int64_t hint) {
 
 CachedINode::~CachedINode() {
   CHECK_EQ(lookups_, 0) << "Shouldn't remove inode with lookups";
-  if (data_->link_count == 0) {
+  if (!old_link_count_.has_value()) {
+    LOG(WARNING) << "Reopen inode " << inode_ << " just for link count";
+    OpenData();
+    old_link_count_ = data()->link_count;
+  }
+  if (old_link_count_ == 0) {
+    OpenData();
     fs->DeleteINodeAndBlocks(this);
   }
+}
+
+void CachedINode::OpenData() {
+  if (data__ != nullptr) {
+    return;
+  }
+  std::tie(block_, data__) = fs->GetINodeData(inode_, inode_table_);
+  old_link_count_.reset();
+}
+
+void CachedINode::CloseData() {
+  CHECK_EQ(opens_, 0);
+  CHECK_NOTNULL(data__);
+  old_link_count_ = data__->link_count;
+  block_.release();
+  data__ = nullptr;
 }
 
 int64_t CachedINode::get_block(int64_t block_index) {
@@ -512,22 +568,22 @@ int64_t CachedINode::get_block(int64_t block_index) {
   CHECK_LE(block_index, num_blocks());
 
   if (block_index < kNumDirectBlocks) {
-    return data_->direct_blocks[block_index];
+    return data()->direct_blocks[block_index];
   }
 
   block_index -= kNumDirectBlocks;
   if (block_index < kNumBlocksPerIndirect) {
-    return fs->LookupIndirect(data_->single_indirect, block_index, 1);
+    return fs->LookupIndirect(data()->single_indirect, block_index, 1);
   }
 
   block_index -= kNumBlocksPerIndirect;
   if (block_index < kNumBlocksPerDoubleIndirect) {
-    return fs->LookupIndirect(data_->double_indirect, block_index, 2);
+    return fs->LookupIndirect(data()->double_indirect, block_index, 2);
   }
 
   block_index -= kNumBlocksPerDoubleIndirect;
   if (block_index < kNumBlocksPerTripleIndirect) {
-    return fs->LookupIndirect(data_->triple_indirect, block_index, 3);
+    return fs->LookupIndirect(data()->triple_indirect, block_index, 3);
   }
 
   LOG(FATAL) << "Block index too large";
@@ -537,32 +593,32 @@ int64_t CachedINode::set_block(int64_t block_index, int64_t block_no) {
   set_modified();
 
   if (block_index < kNumDirectBlocks) {
-    const int64_t old_block_no = data_->direct_blocks[block_index];
-    data_->direct_blocks[block_index] = block_no;
+    const int64_t old_block_no = data()->direct_blocks[block_index];
+    datam()->direct_blocks[block_index] = block_no;
     return old_block_no;
   }
 
   int64_t old_block_no;
   block_index -= kNumDirectBlocks;
   if (block_index < kNumBlocksPerIndirect) {
-    data_->single_indirect =
-        fs->WriteIndirect(data_->single_indirect, get_hint(), block_index,
+    datam()->single_indirect =
+        fs->WriteIndirect(data()->single_indirect, get_hint(), block_index,
                           block_no, 1, &old_block_no);
     return old_block_no;
   }
 
   block_index -= kNumBlocksPerIndirect;
   if (block_index < kNumBlocksPerDoubleIndirect) {
-    data_->double_indirect =
-        fs->WriteIndirect(data_->double_indirect, get_hint(), block_index,
+    datam()->double_indirect =
+        fs->WriteIndirect(data()->double_indirect, get_hint(), block_index,
                           block_no, 2, &old_block_no);
     return old_block_no;
   }
 
   block_index -= kNumBlocksPerDoubleIndirect;
   if (block_index < kNumBlocksPerTripleIndirect) {
-    data_->triple_indirect =
-        fs->WriteIndirect(data_->triple_indirect, get_hint(), block_index,
+    datam()->triple_indirect =
+        fs->WriteIndirect(data()->triple_indirect, get_hint(), block_index,
                           block_no, 3, &old_block_no);
     return old_block_no;
   }
@@ -608,7 +664,7 @@ void read_write_helper(const int64_t size, const int64_t offset, auto&& op) {
 
 void CachedINode::read(std::span<uint8_t> out, int64_t offset) {
   const auto size = std::ssize(out);
-  CHECK_LT(size + offset, data_->size);
+  CHECK_LT(size + offset, data()->size);
 
   block_.MoveToHead();
 
@@ -624,7 +680,7 @@ void CachedINode::read(std::span<uint8_t> out, int64_t offset) {
 
 void CachedINode::read_iovec(int64_t size, int64_t offset,
                              std::function<void(std::span<iovec>)> outs) {
-  CHECK_LE(size + offset, data_->size);
+  CHECK_LE(size + offset, data()->size);
 
   block_.MoveToHead();
 
@@ -650,14 +706,13 @@ void CachedINode::read_iovec(int64_t size, int64_t offset,
 
 void CachedINode::write(std::span<const uint8_t> in, int64_t offset) {
   const auto size = std::ssize(in);
-  CHECK_LE(size + offset, data_->size);
+  CHECK_LE(size + offset, data()->size);
 
   read_write_helper(size, offset,
                     [this, in](int64_t block_i, int64_t bytes_read,
                                int64_t local_size, int64_t start) {
                       auto blk = get_block(block_i);
                       CHECK_NE(blk, 0);
-                      LOG(INFO) << "Write to " << blk << " " << local_size;
                       fs->blocks_->WriteBlock(
                           blk, in.subspan(bytes_read, local_size), start);
                     });
@@ -668,7 +723,7 @@ void CachedINode::write(std::span<const uint8_t> in, int64_t offset) {
 // if not by appending. Directory entries cannot span blocks.
 bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode,
                                     Type type) {
-  CHECK(data_->mode == Type::kDirectory);
+  CHECK(data()->mode == Type::kDirectory);
 
   int32_t blknum = 0;
   const int32_t nblocks = num_blocks();
@@ -741,7 +796,7 @@ bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode,
   }
 
   // Couldn't allocate in an existing region, add a new block
-  CHECK(fs->GrowINode(this, data_->size + kBlockSize));
+  CHECK(fs->GrowINode(this, data()->size + kBlockSize));
   auto blk = fs->blocks_->LockBlock(get_block(nblocks));
 
   DirectoryEntry* new_entry =
@@ -757,7 +812,7 @@ bool CachedINode::AddDirectoryEntry(std::string_view filename, int64_t inode,
 }
 
 std::optional<int64_t> CachedINode::RemoveDE(std::string_view filename) {
-  CHECK(data_->mode == Type::kDirectory);
+  CHECK(data()->mode == Type::kDirectory);
 
   int32_t blknum = 0;
   const int32_t nblocks = num_blocks();
@@ -811,14 +866,14 @@ std::optional<int64_t> CachedINode::RemoveDE(std::string_view filename) {
   return std::nullopt;
 }
 
-CachedINode* CachedINode::LookupFile(std::string_view filename) {
-  CHECK(data_->mode == Type::kDirectory);
+std::optional<int64_t> CachedINode::LookupFile(std::string_view filename) {
+  CHECK(data()->mode == Type::kDirectory);
   CHECK_LE(std::ssize(filename), kFilenameLen);
 
-  CachedINode* result = nullptr;
+  std::optional<int64_t> result;
   ReadDir(0, [this, filename, &result](const DirectoryEntry* de, off_t) {
     if (filename == de->name_str()) {
-      result = fs->GetINode(de->inode);
+      result = de->inode;
       return false;
     } else {
       return true;
@@ -831,14 +886,15 @@ CachedINode* CachedINode::LookupFile(std::string_view filename) {
 void CachedINode::ReadDir(
     const off_t off,
     std::function<bool(const DirectoryEntry*, off_t)> callback) {
-  CHECK(data_->mode == Type::kDirectory);
+  CHECK(data()->mode == Type::kDirectory);
 
   // We use off as follows: first to determine the starting block.
   // Then, seek to the first directory entry with an offset at least off
   // from the start of the block. This should satisfy the modification while
   // iterating rules.
 
-  int32_t blknum = off / kBlockSize;
+  const int32_t start_block = off / kBlockSize;
+  int32_t blknum = start_block;
   const int32_t nblocks = num_blocks();
 
   const auto off_local = off % kBlockSize;
@@ -864,7 +920,7 @@ void CachedINode::ReadDir(
 
       // LOG(INFO) << de->name_str() << " " << next_off << " " << de_off << " "
       //           << off_local;
-      if (de_off < off_local) {
+      if (blknum == start_block && de_off < off_local) {
         // Skip blocks whose offset is less than our starting offset
         continue;
       }
@@ -884,7 +940,7 @@ void CachedINode::ReadDir(
 }
 
 bool CachedINode::IsEmpty() {
-  CHECK(data_->mode == Type::kDirectory);
+  CHECK(data()->mode == Type::kDirectory);
 
   bool is_empty = true;
   ReadDir(0, [&is_empty](const DirectoryEntry* de, off_t) {
@@ -902,26 +958,28 @@ void CachedINode::FillStat(struct stat* attr) {
   memset(attr, 0, sizeof(struct stat));
 
   attr->st_ino = inode_;
-  CHECK(FlagsToMode(data_->mode, data_->flags, &attr->st_mode));
-  attr->st_nlink = data_->link_count;
-  attr->st_uid = data_->uid;
-  attr->st_gid = data_->gid;
+  CHECK(FlagsToMode(data()->mode, data()->flags, &attr->st_mode));
+  attr->st_nlink = data()->link_count;
+  attr->st_uid = data()->uid;
+  attr->st_gid = data()->gid;
 #if __linux__
-  attr->st_atime = data_->atime;
-  attr->st_mtime = data_->mtime;
-  attr->st_ctime = data_->ctime;
+  attr->st_atime = data()->atime;
+  attr->st_mtime = data()->mtime;
+  attr->st_ctime = data()->ctime;
 #elif __APPLE__
   attr->st_atimespec =
-      timespec{.tv_sec = static_cast<long>(data_->atime), .tv_nsec = 0};
+      timespec{.tv_sec = static_cast<long>(data()->atime), .tv_nsec = 0};
   attr->st_mtimespec =
-      timespec{.tv_sec = static_cast<long>(data_->mtime), .tv_nsec = 0};
+      timespec{.tv_sec = static_cast<long>(data()->mtime), .tv_nsec = 0};
   attr->st_ctimespec =
-      timespec{.tv_sec = static_cast<long>(data_->ctime), .tv_nsec = 0};
+      timespec{.tv_sec = static_cast<long>(data()->ctime), .tv_nsec = 0};
 #endif
-  attr->st_size = data_->size;
+  attr->st_size = data()->size;
   attr->st_blocks = num_blocks();
   attr->st_blksize = kBlockSize;
 }
+
+RAIIInode::~RAIIInode() { fs_->CloseInode(inode_->inode_); }
 
 int64_t Fileosophy::LookupIndirect(const int64_t indirect_list,
                                    const int64_t block_index, int depth) {

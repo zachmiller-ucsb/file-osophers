@@ -69,7 +69,6 @@ class PinnedBlock {
     static_assert(std::is_standard_layout_v<T> && std::is_trivial_v<T>);
     auto data = data_mutable();
     static_assert(sizeof(T) == kBlockSize);
-    block_->set_modified();
     return reinterpret_cast<T*>(data.data());
   }
 
@@ -78,9 +77,10 @@ class PinnedBlock {
 
   int64_t id() const { return block_->id(); }
 
+  void release();
+
  private:
   void reset(Block* block);
-  void release();
 
   Block* block_;
 };
