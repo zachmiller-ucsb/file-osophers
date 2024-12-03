@@ -167,7 +167,7 @@ std::optional<int64_t> AllocInBitmap(std::span<uint8_t> bitmap, int64_t hint,
     if (try_pos(hint)) {
       write_pos(hint);
       return hint;
-    } else if (hint < num_slots - 1 && try_pos(hint)) {
+    } else if (hint < num_slots - 1 && try_pos(hint + 1)) {
       write_pos(hint + 1);
       return hint + 1;
     }
