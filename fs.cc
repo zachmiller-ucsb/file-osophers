@@ -135,6 +135,8 @@ std::pair<PinnedBlock, INode*> Fileosophy::GetINodeData(
 }
 
 CachedINode* Fileosophy::GetINode(int64_t inode) {
+  CHECK_NE(inode, 0);
+
   if (auto search = opened_files_.find(inode); search != opened_files_.end()) {
     search->second.OpenData();
     search->second.block_.MoveToHead();
@@ -367,8 +369,9 @@ bool Fileosophy::GrowINode(CachedINode* inode, int64_t new_size) {
   for (int64_t blk = num_blocks; blk < new_num_blocks; ++blk) {
     auto new_blk = NewFreeBlock(hint);
     CHECK(new_blk.has_value());
-    LOG(INFO) << "Inode " << inode->inode_ << " allocate new block " << *new_blk
-              << " hint " << hint;
+    // LOG(INFO) << "Inode " << inode->inode_ << " allocate new block " <<
+    // *new_blk
+    //           << " hint " << hint;
     blocks_->WriteBlock(*new_blk, kEmptyBlock);
     CHECK_EQ(inode->set_block(blk, *new_blk), 0);
     hint = *new_blk + 1;
@@ -532,6 +535,17 @@ std::optional<int64_t> Fileosophy::NewFreeBlock(int64_t hint) {
   CHECK(new_block.has_value());
 
   return new_block;
+}
+
+CachedINode::CachedINode(int64_t inode, INode* data, PinnedBlock block,
+                         Fileosophy* fs)
+    : inode_(inode),
+      data__(data),
+      block_(block),
+      fs(fs),
+      block_group_(GroupOfInode(inode)),
+      inode_table_(block.id()) {
+  CHECK(inode_ != 0);
 }
 
 CachedINode::~CachedINode() {
@@ -920,7 +934,7 @@ void CachedINode::ReadDir(
       const auto next_off = (blknum * kBlockSize) + (blkdata - start);
 
       // LOG(INFO) << de->name_str() << " " << next_off << " " << de_off << " "
-      //           << off_local;
+      //           << off_local << ' ' << de->alloc_length << ' ' << blknum;
       if (blknum == start_block && de_off < off_local) {
         // Skip blocks whose offset is less than our starting offset
         continue;

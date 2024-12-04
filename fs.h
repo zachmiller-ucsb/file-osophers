@@ -221,13 +221,7 @@ inline int64_t LocalINodeToGlobal(int64_t group_i, int64_t inode) {
 class Fileosophy;
 
 struct CachedINode {
-  CachedINode(int64_t inode, INode* data, PinnedBlock block, Fileosophy* fs)
-      : inode_(inode),
-        data__(data),
-        block_(block),
-        fs(fs),
-        block_group_(GroupOfInode(inode)),
-        inode_table_(block.id()) {}
+  CachedINode(int64_t inode, INode* data, PinnedBlock block, Fileosophy* fs);
 
   ~CachedINode();
 

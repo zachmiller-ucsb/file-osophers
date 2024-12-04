@@ -162,6 +162,7 @@ Block* BlockCache::LoadBlockToCache(int64_t block) {
     Block* blk_iter = lru_tail_;
     while (blk_iter != nullptr) {
       if (blk_iter->ref_count() == 0) {
+        // LOG(INFO) << "Open " << block << " drop " << blk_iter->id();
         Drop(blk_iter->id());
         break;
       } else {

@@ -249,9 +249,8 @@ void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
   }
 
   auto ctx = fuse_req_ctx(req);
-  auto inode = fs->GetINode(*ino);
 
-  inode = fs->NewINode(parent_dir->block_group_);
+  auto inode = fs->NewINode(parent_dir->block_group_);
   auto datam = inode->datam();
   fs->InitINode(datam, type, flags, ctx->uid, ctx->gid);
 
