@@ -903,6 +903,7 @@ void CachedINode::ReadDir(
 
   block_.MoveToHead();
 
+  bool done = false;
   while (blknum < nblocks) {
     auto blki = get_block(blknum);
     auto blk = fs->blocks_->LockBlock(blki);
@@ -931,9 +932,14 @@ void CachedINode::ReadDir(
       }
 
       if (!callback(de, next_off)) {
+        done = true;
         break;
       }
     } while (blkdata != end);
+
+    if (done) {
+      break;
+    }
 
     ++blknum;
   }
